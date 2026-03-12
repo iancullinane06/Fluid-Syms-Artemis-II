@@ -6,7 +6,7 @@ from FluidSimulation import FluidSimulation
 from Functions import calculate_reynolds_number, calculate_drag_coefficient
 
 
-# Initialize the rocket profile
+# Initialise the rocket profile
 # width = diameter (y), height = axial length (x) — both in grid cells.
 # At 400×400, width=40/height=112 preserves the same proportions as before
 # (~28% domain length, 10% blockage) with much sharper boundary resolution.
@@ -65,7 +65,7 @@ def compute_diagnostics(sim: FluidSimulation):
 
     return speed, vorticity, drag_proxy
 
-# Initialize the fluid simulation
+# Initialise the fluid simulation
 grid_size = (400, 400)  # 4× per axis from 100×100 for much finer boundary/wake detail
 viscosity = 0.006  # Higher-Re flow so wake rolls up instead of diffusing out
 time_step = 0.1  # Time step

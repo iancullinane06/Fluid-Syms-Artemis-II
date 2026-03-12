@@ -60,6 +60,8 @@ class FluidSimulation:
         self.rocket_velocity_profile = rocket_velocity_profile
         self.inflow_blend = float(np.clip(inflow_blend, 0.0, 1.0))
         self.base_ambient_velocity = self.edge_speed * self.freestream_direction
+        self.relative_velocity_target = self.base_ambient_velocity.copy()
+        self.reference_acceleration_vector = np.zeros(2, dtype=float)
         self.wall_distance = None
         self.wall_normal_x = np.zeros(grid_size, dtype=float)
         self.wall_normal_y = np.zeros(grid_size, dtype=float)
@@ -99,8 +101,10 @@ class FluidSimulation:
         self.freestream_direction = direction_vector
         self.edge_speed = flow_speed
         self.base_ambient_velocity = flow_speed * direction_vector
-        self.u[:, :] = flow_speed * direction_vector[0]
-        self.v[:, :] = flow_speed * direction_vector[1]
+        self.relative_velocity_target = self.base_ambient_velocity.copy()
+        self.reference_acceleration_vector.fill(0.0)
+        self.u[:, :] = flow_speed * float(direction_vector[0])
+        self.v[:, :] = flow_speed * float(direction_vector[1])
         self._enforce_obstacle_boundary()
         self._enforce_domain_boundary()
 
@@ -116,6 +120,7 @@ class FluidSimulation:
 
     def _update_reference_frame(self):
         """Update freestream from ambient flow and rocket motion in a rocket-fixed frame."""
+        previous_relative_velocity = self.relative_velocity_target.copy()
         ambient_velocity = self._resolve_profile_velocity(
             self.ambient_velocity_profile,
             self.simulation_time,
@@ -128,6 +133,10 @@ class FluidSimulation:
         )
         relative_velocity = ambient_velocity - rocket_velocity
         speed = float(np.linalg.norm(relative_velocity))
+        self.relative_velocity_target = relative_velocity.copy()
+
+        dt = max(float(self.time_step), 1e-8)
+        self.reference_acceleration_vector = (self.relative_velocity_target - previous_relative_velocity) / dt
 
         if speed > 1e-12:
             self.freestream_direction = relative_velocity / speed
@@ -358,13 +367,23 @@ class FluidSimulation:
         return dilated
 
     def _apply_body_force(self):
-        """Apply uniform acceleration to fluid cells along configured direction."""
-        if self.acceleration == 0.0:
-            return
+        """Apply uniform body-force acceleration to fluid cells.
+
+        Two sources are combined:
+        1) User-configured constant acceleration (magnitude + direction)
+        2) Reference-frame acceleration from d(u_ambient - u_rocket)/dt
+        """
         fluid = ~self.obstacle_mask
-        accel_step = self.acceleration * self.time_step
-        self.u[fluid] += accel_step * self.acceleration_direction[0]
-        self.v[fluid] += accel_step * self.acceleration_direction[1]
+        if not np.any(fluid):
+            return
+
+        acceleration_vector = self.reference_acceleration_vector.copy()
+        if self.acceleration != 0.0:
+            acceleration_vector += self.acceleration * self.acceleration_direction
+
+        accel_step = acceleration_vector * self.time_step
+        self.u[fluid] += accel_step[0]
+        self.v[fluid] += accel_step[1]
 
     def _enforce_domain_boundary(self):
         """Outer-domain boundary model (laminar freestream or fallback no-slip)."""

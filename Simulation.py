@@ -1,6 +1,7 @@
 from Classes import RocketProfile, NoseconeModel
 import numpy as np
 import matplotlib.pyplot as plt
+import time
 from matplotlib.widgets import Slider
 from FluidSimulation import FluidSimulation
 from Functions import calculate_reynolds_number, calculate_drag_coefficient
@@ -95,6 +96,34 @@ def compute_diagnostics(sim: FluidSimulation):
 
     return speed, vorticity, drag_proxy, pressure, streamwise_velocity, shear_stress
 
+
+def format_duration(seconds: float) -> str:
+    seconds = max(float(seconds), 0.0)
+    minutes, secs = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    if minutes > 0:
+        return f"{minutes:d}m {secs:02d}s"
+    return f"{secs:d}s"
+
+
+def update_progress_bar(current: int, total: int, start_time: float, width: int = 32) -> None:
+    total = max(int(total), 1)
+    current = min(max(int(current), 0), total)
+    fraction = current / total
+    filled = int(round(width * fraction))
+    bar = "#" * filled + "-" * (width - filled)
+    elapsed = max(time.perf_counter() - start_time, 0.0)
+    eta_seconds = 0.0 if current <= 0 else elapsed * max(total - current, 0) / max(current, 1)
+    print(
+        f"\rPrecomputing frames: [{bar}] {current}/{total} ({fraction * 100:5.1f}%) | ETA {format_duration(eta_seconds)}",
+        end="",
+        flush=True,
+    )
+    if current >= total:
+        print(f" | done in {format_duration(elapsed)}")
+
 # Initialise the fluid simulation
 grid_size = (300, 600)  # Height x Width
 viscosity = 0.0000018  # Lower diffusion to preserve wake structures
@@ -161,7 +190,10 @@ global_min_pressure = np.inf
 global_max_pressure = -np.inf
 global_max_shear = -np.inf
 
-for _ in range(num_frames):
+precompute_start_time = time.perf_counter()
+update_progress_bar(0, num_frames, precompute_start_time)
+
+for frame_index in range(num_frames):
     simulation.simulate_particles(steps=steps_per_frame)
     dx = simulation.u.copy()
     dy = simulation.v.copy()
@@ -198,6 +230,7 @@ for _ in range(num_frames):
 
     frames.append((dx, dy, speed_plot, vorticity_plot, pressure_plot, streamwise_plot, shear_plot, frame_time, frame_speed, drag_proxy))
     drag_history.append((frame_time, drag_proxy))
+    update_progress_bar(frame_index + 1, num_frames, precompute_start_time)
 
 if not np.isfinite(global_min_speed) or not np.isfinite(global_max_speed):
     global_min_speed, global_max_speed = 0.0, 1.0

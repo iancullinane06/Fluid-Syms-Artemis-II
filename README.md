@@ -1,10 +1,10 @@
 # Fluid-Syms-Artemis-II
 
-2D rocket-frame CFD-style prototype for visualizing flow, wake formation, and drag trends around a rocket obstacle.
+2D rocket-frame CFD-style prototype for visualising flow, wake formation, and drag trends around a rocket obstacle.
 
 ## What this sim does
 
-The solver evolves a 2D velocity field around a rasterized rocket profile using a simplified incompressible Navier–Stokes pipeline:
+The solver evolves a 2D velocity field around a rasterised rocket profile using a simplified incompressible Navier–Stokes pipeline:
 
 1. Update rocket-frame freestream from ambient and rocket velocity profiles
 2. Advect velocity (semi-Lagrangian, SciPy interpolation)
@@ -16,7 +16,7 @@ The solver evolves a 2D velocity field around a rasterized rocket profile using 
 Main files:
 
 - [FluidSimulation.py](FluidSimulation.py): solver core
-- [Simulation.py](Simulation.py): demo setup, Artemis-like ascent profile, visualization
+- [Simulation.py](Simulation.py): demo setup, Artemis-like ascent profile, visualisation
 - [Classes.py](Classes.py): rocket geometry/profile dataclasses
 - [Functions.py](Functions.py): Reynolds number and drag-coefficient helpers
 - [Drag.py](Drag.py): separate 1D ascent/drag model (not tightly coupled to 2D solver)
@@ -121,7 +121,7 @@ $$
 \nabla\cdot\mathbf{u}^{n+1} \approx 0
 $$
 
-### 7) Drag proxy used in visualization
+### 7) Drag proxy used in visualisation
 
 The plotted drag trend is a proxy combining near-wall dynamic-pressure-like and shear-like terms:
 
@@ -142,7 +142,7 @@ It is useful for trends, not a full force integration.
 
 In [Simulation.py](Simulation.py):
 
-- Grid: `400 x 400`
+- Grid: `300 x 600`
 - Rocket profile scaled to keep proportions at high resolution
 - Artemis-like ascent speed envelope (scaled to stable solver units)
 - Warm-up steps before frame capture to reduce startup transient artifacts

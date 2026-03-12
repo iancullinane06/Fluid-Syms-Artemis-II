@@ -569,16 +569,6 @@ class FluidSimulation:
             + field[y1, x1] * (x - x0) * (y - y0)
         )
 
-    def plot(self):
-        """
-        Plot the velocity field.
-        """
-        plt.quiver(self.u, self.v)
-        plt.title("Velocity Field")
-        plt.xlabel("X")
-        plt.ylabel("Y")
-        plt.show()
-
     def simulate_particles(self, steps: int = 1) -> None:
         """
         Run the particle/fluid simulation for a number of steps.

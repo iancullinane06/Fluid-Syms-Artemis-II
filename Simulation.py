@@ -5,6 +5,10 @@ from matplotlib.widgets import Slider
 from FluidSimulation import FluidSimulation
 from Functions import calculate_reynolds_number, calculate_drag_coefficient
 
+time_step = 4
+sim_time = 320
+num_frames = int(sim_time / time_step)
+
 
 # Initialise the rocket profile
 # width = diameter (y), height = axial length (x) — both in grid cells.
@@ -17,7 +21,7 @@ def ambient_velocity_profile(time_s: float) -> np.ndarray:
     # initial relative speed does not start artificially high.
     base_wind = 0.8
     gust = 0.25 * np.sin(0.28 * time_s) + 0.15 * np.sin(0.92 * time_s + 0.35)
-    return np.array([-(base_wind + gust), 0.0], dtype=float)
+    return np.array([0.0, -(base_wind + gust)], dtype=float)
 
 
 def rocket_velocity_profile(time_s: float) -> np.ndarray:
@@ -32,7 +36,7 @@ def rocket_velocity_profile(time_s: float) -> np.ndarray:
     physical_speed_mps = float(np.interp(profile_time, time_knots_s, speed_knots_mps))
 
     # Convert to solver units. Larger than before so acceleration is obvious.
-    sim_speed_scale = 1.0 / 70.0
+    sim_speed_scale = 1.0 / 30.0
     speed = physical_speed_mps * sim_speed_scale
 
     pitch = 0.07 * np.sin(0.09 * time_s)
@@ -66,9 +70,8 @@ def compute_diagnostics(sim: FluidSimulation):
     return speed, vorticity, drag_proxy
 
 # Initialise the fluid simulation
-grid_size = (400, 400)  # 4× per axis from 100×100 for much finer boundary/wake detail
-viscosity = 0.006  # Higher-Re flow so wake rolls up instead of diffusing out
-time_step = 0.1  # Time step
+grid_size = (300, 600)  # Height x Width
+viscosity = 0.03  # Higher-Re flow so wake rolls up instead of diffusing out
 density = 1.225  # Air density
 initial_relative_velocity = ambient_velocity_profile(0.0) - rocket_velocity_profile(0.0)
 initial_speed = float(np.linalg.norm(initial_relative_velocity))
@@ -120,9 +123,7 @@ quiver_stride = 16  # stride=16 on 400×400 keeps quiver density readable (~25×
 Xq = X[::quiver_stride, ::quiver_stride]
 Yq = Y[::quiver_stride, ::quiver_stride]
 
-
 # Precompute flow frames for slider-based time navigation.
-num_frames = 520
 total_time = num_frames * time_step
 obstacle = simulation.obstacle_mask
 frames = []

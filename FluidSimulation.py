@@ -38,6 +38,7 @@ class FluidSimulation:
             time_step (float): Time step (s).
             density (float): Fluid density (kg/m^3).
             rocket_profile (RocketProfile, optional): Rocket profile object.
+            
         """
         self.grid_size = grid_size  # (nx, ny)
         self.viscosity = viscosity  # Kinematic viscosity (m^2/s)

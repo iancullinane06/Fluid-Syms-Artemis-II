@@ -4,13 +4,13 @@ import matplotlib.pyplot as plt
 import time
 from matplotlib.widgets import Slider
 from FluidSimulation import FluidSimulation
-from Functions import calculate_reynolds_number, calculate_drag_coefficient
+from Graphing import format_duration, update_progress_bar
 
 # Physics and display cadence are decoupled:
 # - small physics dt keeps advection/projection stable
 # - larger frame interval keeps animation length manageable
 time_step = 0.1
-sim_time = 100.0
+sim_time = 64.0
 frame_interval = 1.0
 steps_per_frame = max(int(round(frame_interval / time_step)), 1)
 num_frames = int(sim_time / frame_interval)
@@ -82,47 +82,59 @@ def compute_diagnostics(sim: FluidSimulation):
     # Shear stress magnitude: sqrt(τ_xy^2 + τ_yy^2) near boundary
     shear_stress = dynamic_viscosity * np.sqrt((dudy_shear + dvdx_shear)**2 + dvdy**2)
 
-    # Drag proxy from freestream dynamic pressure + Reynolds-based Cd trend.
-    characteristic_length = max(float(getattr(sim.rocket_profile, "height", 1.0)), 1e-6)
-    reynolds_number = calculate_reynolds_number(
-        density=sim.density,
-        velocity=max(sim.edge_speed, 1e-6),
-        characteristic_length=characteristic_length,
-        viscosity=dynamic_viscosity,
-    )
-    drag_coefficient = calculate_drag_coefficient(reynolds_number)
-    projected_area = max(float(getattr(sim.rocket_profile, "width", 1.0)), 1.0)
-    drag_proxy = float(0.5 * sim.density * (sim.edge_speed ** 2) * drag_coefficient * projected_area)
+    if getattr(sim, "wall_distance", None) is None:
+        sim._update_wall_geometry()
 
-    return speed, vorticity, drag_proxy, pressure, streamwise_velocity, shear_stress
+    obstacle = sim.obstacle_mask
+    wall_distance = np.array(sim.wall_distance, dtype=float) if sim.wall_distance is not None else np.full_like(obstacle, np.nan, dtype=float)
+    surface_band = (~obstacle) & np.isfinite(wall_distance) & (wall_distance > 0.0) & (wall_distance <= 1.5)
 
+    total_drag = 0.0
+    pressure_drag = 0.0
+    shear_drag = 0.0
 
-def format_duration(seconds: float) -> str:
-    seconds = max(float(seconds), 0.0)
-    minutes, secs = divmod(int(round(seconds)), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours > 0:
-        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
-    if minutes > 0:
-        return f"{minutes:d}m {secs:02d}s"
-    return f"{secs:d}s"
+    if np.any(surface_band):
+        nx = -sim.wall_normal_x[surface_band]
+        ny = -sim.wall_normal_y[surface_band]
+        normal_mag = np.sqrt(nx**2 + ny**2)
+        valid = normal_mag > 1e-8
+        if np.any(valid):
+            nx = nx[valid] / normal_mag[valid]
+            ny = ny[valid] / normal_mag[valid]
 
+            p_local = pressure[surface_band][valid]
 
-def update_progress_bar(current: int, total: int, start_time: float, width: int = 32) -> None:
-    total = max(int(total), 1)
-    current = min(max(int(current), 0), total)
-    fraction = current / total
-    filled = int(round(width * fraction))
-    bar = "#" * filled + "-" * (width - filled)
-    elapsed = max(time.perf_counter() - start_time, 0.0)
-    eta_seconds = 0.0 if current <= 0 else elapsed * max(total - current, 0) / max(current, 1)
-    print(
-        f"\rPrecomputing frames: [{bar}] {current}/{total} ({fraction * 100:5.1f}%) | ETA {format_duration(eta_seconds)}",
-        end="",
-        flush=True,
-    )
-    if current >= total:
-        print(f" | done in {format_duration(elapsed)}")
+            # Pressure traction on body: -p * n_out
+            pressure_force_x = -p_local * nx
+            pressure_force_y = -p_local * ny
+
+            tx = -ny
+            ty = nx
+            u_local = sim.u[surface_band][valid]
+            v_local = sim.v[surface_band][valid]
+            tangential_velocity = u_local * tx + v_local * ty
+
+            normal_distance = np.maximum(wall_distance[surface_band][valid], 1.0)
+            tangential_shear = dynamic_viscosity * tangential_velocity / normal_distance
+
+            # Shear force on body opposes local tangential fluid motion.
+            shear_force_x = -tangential_shear * tx
+            shear_force_y = -tangential_shear * ty
+
+            force_x = np.sum(pressure_force_x + shear_force_x)
+            force_y = np.sum(pressure_force_y + shear_force_y)
+
+            pressure_force_x_total = np.sum(pressure_force_x)
+            pressure_force_y_total = np.sum(pressure_force_y)
+            shear_force_x_total = np.sum(shear_force_x)
+            shear_force_y_total = np.sum(shear_force_y)
+
+            drag_direction = sim.freestream_direction
+            total_drag = float(force_x * drag_direction[0] + force_y * drag_direction[1])
+            pressure_drag = float(pressure_force_x_total * drag_direction[0] + pressure_force_y_total * drag_direction[1])
+            shear_drag = float(shear_force_x_total * drag_direction[0] + shear_force_y_total * drag_direction[1])
+
+    return speed, vorticity, total_drag, pressure_drag, shear_drag, pressure, streamwise_velocity, shear_stress
 
 # Initialise the fluid simulation
 grid_size = (300, 600)  # Height x Width
@@ -145,8 +157,8 @@ simulation = FluidSimulation(
     edge_relaxation=0.985,
     wall_penalty=22.0,         # reduce over-damping; still no-slip near wall
     wall_shear_layers=6,
-    turbulence_strength=0.2,  # lower SGS damping so wake structures survive
-    vorticity_confinement=0.08,
+    turbulence_strength=0.8,  # lower SGS damping so wake structures survive
+    vorticity_confinement=0.32,
     ambient_velocity_profile=ambient_velocity_profile,
     rocket_velocity_profile=rocket_velocity_profile,
     inflow_blend=0.02,
@@ -197,7 +209,7 @@ for frame_index in range(num_frames):
     simulation.simulate_particles(steps=steps_per_frame)
     dx = simulation.u.copy()
     dy = simulation.v.copy()
-    speed, vorticity, drag_proxy, pressure, streamwise_velocity, shear_stress = compute_diagnostics(simulation)
+    speed, vorticity, drag_total, drag_pressure, drag_shear, pressure, streamwise_velocity, shear_stress = compute_diagnostics(simulation)
     frame_time = simulation.simulation_time
     frame_speed = simulation.edge_speed
 
@@ -228,8 +240,8 @@ for frame_index in range(num_frames):
     if finite_shear.size > 0:
         global_max_shear = max(global_max_shear, float(np.max(finite_shear)))
 
-    frames.append((dx, dy, speed_plot, vorticity_plot, pressure_plot, streamwise_plot, shear_plot, frame_time, frame_speed, drag_proxy))
-    drag_history.append((frame_time, drag_proxy))
+    frames.append((dx, dy, speed_plot, vorticity_plot, pressure_plot, streamwise_plot, shear_plot, frame_time, frame_speed, drag_total, drag_pressure, drag_shear))
+    drag_history.append((frame_speed, drag_total, drag_pressure, drag_shear))
     update_progress_bar(frame_index + 1, num_frames, precompute_start_time)
 
 if not np.isfinite(global_min_speed) or not np.isfinite(global_max_speed):
@@ -264,7 +276,7 @@ def draw_frame(frame_index):
     
     ax_drag.clear()
     
-    dx, dy, speed_plot, vorticity_plot, pressure_plot, streamwise_plot, shear_plot, frame_time, frame_speed, drag_proxy = frames[frame_index]
+    dx, dy, speed_plot, vorticity_plot, pressure_plot, streamwise_plot, shear_plot, frame_time, frame_speed, drag_total, drag_pressure, drag_shear = frames[frame_index]
 
     # Top-left: Velocity magnitude
     ax_speed.set_facecolor("white")
@@ -368,21 +380,35 @@ def draw_frame(frame_index):
     else:
         colorbars["vortex"].update_normal(im_vortex)
 
-    # Bottom-middle: Drag history
-    history_times = np.array([item[0] for item in drag_history[: frame_index + 1]], dtype=float)
-    history_drag = np.array([item[1] for item in drag_history[: frame_index + 1]], dtype=float)
-    ax_drag.plot(history_times, history_drag, color="#1f77b4", linewidth=2.0)
-    ax_drag.scatter([frame_time], [drag_proxy], color="red", s=36, zorder=3)
-    ax_drag.set_xlim(0.0, max(total_time, 1e-6))
-    if history_drag.size > 0:
-        y_max = max(float(np.max(history_drag)) * 1.15, 1e-6)
+    # Bottom-middle: Actual drag vs freestream velocity.
+    history_velocity = np.array([item[0] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_drag_total = np.array([item[1] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_drag_pressure = np.array([item[2] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_drag_shear = np.array([item[3] for item in drag_history[: frame_index + 1]], dtype=float)
+
+    ax_drag.plot(history_velocity, history_drag_total, color="#1f77b4", linewidth=2.0, label="Total")
+    ax_drag.plot(history_velocity, history_drag_pressure, color="#d62728", linewidth=1.3, linestyle="--", label="Pressure")
+    ax_drag.plot(history_velocity, history_drag_shear, color="#2ca02c", linewidth=1.3, linestyle="--", label="Shear")
+    ax_drag.scatter([frame_speed], [drag_total], color="black", s=34, zorder=3)
+
+    if history_velocity.size > 0:
+        x_min = float(np.min(history_velocity))
+        x_max = float(np.max(history_velocity))
+        x_pad = max(0.05 * (x_max - x_min), 1e-3)
+        ax_drag.set_xlim(x_min - x_pad, x_max + x_pad)
     else:
-        y_max = 1.0
-    ax_drag.set_ylim(0.0, y_max)
-    ax_drag.set_ylabel("Drag Force (N)", fontsize=9)
-    ax_drag.set_xlabel("Time (s)", fontsize=9)
+        ax_drag.set_xlim(0.0, 1.0)
+
+    combined_drag = np.concatenate((history_drag_total, history_drag_pressure, history_drag_shear)) if history_drag_total.size > 0 else np.array([0.0])
+    y_min = float(np.min(combined_drag))
+    y_max = float(np.max(combined_drag))
+    y_span = max(y_max - y_min, 1e-6)
+    ax_drag.set_ylim(y_min - 0.1 * y_span, y_max + 0.1 * y_span)
+    ax_drag.set_ylabel("Drag (solver units)", fontsize=9)
+    ax_drag.set_xlabel("Freestream Velocity |U∞|", fontsize=9)
     ax_drag.grid(True, alpha=0.3)
-    ax_drag.set_title("Drag History", fontsize=10)
+    ax_drag.set_title("Actual Drag vs Velocity", fontsize=10)
+    ax_drag.legend(fontsize=8, loc="best")
 
     # Bottom-right: Wall shear stress
     ax_shear.set_facecolor("white")

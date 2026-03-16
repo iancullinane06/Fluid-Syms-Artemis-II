@@ -154,7 +154,16 @@ class FluidSimulation:
         self.u[y, x] += strength[0]
         self.v[y, x] += strength[1]
 
-    def add_rocket_profile(self, rocket_profile=None, center=None, body_fraction=0.65, nose_points=128, mask=None):
+    def add_rocket_profile(
+        self,
+        rocket_profile=None,
+        center=None,
+        body_fraction=0.65,
+        nose_points=128,
+        fore_spike_fraction=0.0,
+        fore_spike_half_width_fraction=0.18,
+        mask=None,
+    ):
         """
         Registers a solid obstacle mask from RocketProfile or direct mask.
         """
@@ -180,7 +189,9 @@ class FluidSimulation:
             center_x=cx,
             center_y=cy,
             body_fraction=body_fraction,
-            nose_points=nose_points
+            nose_points=nose_points,
+            fore_spike_fraction=fore_spike_fraction,
+            fore_spike_half_width_fraction=fore_spike_half_width_fraction,
         )
         self._update_wall_geometry()
         return self.obstacle_mask
@@ -294,7 +305,7 @@ class FluidSimulation:
         tangential_velocity = u_local * tx + v_local * ty
 
         normal_velocity *= (1.0 - np.clip(1.35 * damping, 0.0, 0.92))
-        tangential_velocity *= (1.0 - np.clip(1.75 * damping, 0.0, 0.96))
+        tangential_velocity *= (1.0 - np.clip(0.85 * damping, 0.0, 0.85))
 
         self.u[boundary_layer] = normal_velocity * nx + tangential_velocity * tx
         self.v[boundary_layer] = normal_velocity * ny + tangential_velocity * ty
@@ -476,6 +487,18 @@ class FluidSimulation:
         self._enforce_obstacle_boundary()
         self._enforce_domain_boundary()   # final clean-up
         self.simulation_time += self.time_step
+
+    def step_coupled(self, dynamics, dt=None):
+        """Advance fluid one step, then update rocket dynamics from the resulting flow field.
+
+        This keeps the two-way coupling sequence in one place:
+        1) advance CFD with current rocket-frame velocity,
+        2) compute drag from updated flow,
+        3) integrate rocket state for the next step.
+        """
+        self.step()
+        coupling_dt = self.time_step if dt is None else float(dt)
+        return dynamics.integrate_step(self, coupling_dt, self.simulation_time)
 
     def _advect(self):
         """

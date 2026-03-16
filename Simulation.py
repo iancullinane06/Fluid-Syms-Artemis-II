@@ -1,52 +1,71 @@
-from Classes import RocketProfile, NoseconeModel
+from Classes import RocketProfile
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 from matplotlib.widgets import Slider
 from FluidSimulation import FluidSimulation
+from RocketDynamics import RocketDynamics
 from Graphing import format_duration, update_progress_bar
 
 # Physics and display cadence are decoupled:
 # - small physics dt keeps advection/projection stable
 # - larger frame interval keeps animation length manageable
 time_step = 0.1
-sim_time = 64.0
+sim_time = 250.0
 frame_interval = 1.0
 steps_per_frame = max(int(round(frame_interval / time_step)), 1)
 num_frames = int(sim_time / frame_interval)
 
+SIM_SPEED_SCALE = 1.0 / 80.0
 
-# Initialise the rocket profile
-# width = diameter (y), height = axial length (x) — both in grid cells.
-# At 400×400, width=40/height=112 preserves the same proportions as before
-# (~28% domain length, 10% blockage) with much sharper boundary resolution.
-rocket = RocketProfile(name="Test Rocket", mass=1000, thrust=5000, burn_time=120, width=40.0, height=112.0)
+# Artemis-II-inspired slender profile proportions for the 2D silhouette.
+artemis_diameter_m = 8.4
+artemis_length_m = 98.0
+rocket_height_cells = 300  # Example value, adjust as needed
+rocket_width_cells = round(rocket_height_cells * (artemis_diameter_m / artemis_length_m), 1)
+rocket_body_fraction = 0.84
+rocket_nose_points = 96
+rocket_fore_spike_fraction = 0.08
+rocket_fore_spike_half_width_fraction = 0.12
+
+rocket = RocketProfile(
+    name="Artemis-II-like",
+    mass=2_600_000.0,
+    thrust=39_000_000.0,
+    burn_time=510.0,
+    width=rocket_width_cells,
+    height=rocket_height_cells,
+)
+
+
+def thrust_profile_n(time_s: float) -> float:
+    # Approximate Artemis II / SLS Block-1 thrust history.
+    time_knots_s = np.array([0.0, 8.0, 40.0, 80.0, 120.0, 126.0, 320.0, 500.0, 510.0, 700.0], dtype=float)
+    thrust_knots_n = np.array([39.0e6, 38.9e6, 38.5e6, 38.2e6, 37.8e6, 9.0e6, 8.9e6, 8.6e6, 0.0, 0.0], dtype=float)
+    return float(np.interp(float(time_s), time_knots_s, thrust_knots_n))
+
+
+dynamics = RocketDynamics(
+    mass_kg=rocket.mass,
+    thrust_profile=thrust_profile_n,
+    sim_speed_scale=SIM_SPEED_SCALE,
+    drag_force_scale_n=18000.0,
+    flight_direction=(1.0, 0.0),
+    dry_mass_kg=900_000.0,
+    specific_impulse_s=330.0,
+)
 
 def ambient_velocity_profile(time_s: float) -> np.ndarray:
     # Ambient wind in rocket frame should be small at liftoff; keep this mild so
     # initial relative speed does not start artificially high.
-    base_wind = 0.8
-    gust = 0.25 * np.sin(0.28 * time_s) + 0.15 * np.sin(0.92 * time_s + 0.35)
-    return np.array([-(base_wind + gust), 0.0], dtype=float)
+    base_wind_mps = 4.0
+    gust_mps = 1.5 * np.sin(0.28 * time_s) + 0.8 * np.sin(0.92 * time_s + 0.35)
+    wind_solver = (base_wind_mps + gust_mps) * SIM_SPEED_SCALE
+    return np.array([-wind_solver, 0.0], dtype=float)
 
 
 def rocket_velocity_profile(time_s: float) -> np.ndarray:
-    # Artemis-II-like ascent speed envelope (approximate m/s knots), compressed
-    # in demo-time so acceleration is visible within a short 12 s run.
-    time_knots_s = np.array([0.0, 10.0, 30.0, 60.0, 90.0, 120.0, 180.0, 240.0, 480.0], dtype=float)
-    speed_knots_mps = np.array([0.0, 110.0, 420.0, 950.0, 1500.0, 2100.0, 3500.0, 5200.0, 7800.0], dtype=float)
-
-    # Compress physical ascent timeline into demo runtime.
-    demo_time_scale = 3.0
-    profile_time = min(float(time_s) * demo_time_scale, float(time_knots_s[-1]))
-    physical_speed_mps = float(np.interp(profile_time, time_knots_s, speed_knots_mps))
-
-    # Convert to solver units. Larger than before so acceleration is obvious.
-    sim_speed_scale = 1.0 / 120.0
-    speed = physical_speed_mps * sim_speed_scale
-
-    pitch = 0.07 * np.sin(0.09 * time_s)
-    return np.array([speed * np.cos(pitch), speed * np.sin(pitch)], dtype=float)
+    return dynamics.rocket_velocity_profile(time_s)
 
 
 def compute_diagnostics(sim: FluidSimulation):
@@ -62,82 +81,18 @@ def compute_diagnostics(sim: FluidSimulation):
     # Pressure field (already computed during projection step)
     pressure = sim.p.copy()
 
-    # Streamwise velocity component (u in rocket frame)
-    streamwise_velocity = sim.u.copy()
+    # Streamwise velocity component projected onto current freestream direction.
+    streamwise_velocity = (
+        sim.u * float(sim.freestream_direction[0])
+        + sim.v * float(sim.freestream_direction[1])
+    )
 
-    # Wall shear stress magnitude: compute velocity gradients and shear
-    # τ_xy = μ * (du/dy + dv/dx), τ = sqrt(τ_xx^2 + τ_xy^2 + τ_yy^2)
-    # For visualization, use simplified magnitude: μ * speed_gradient
-    dudx = np.zeros_like(sim.u)
-    dvdy = np.zeros_like(sim.v)
-    dudy_shear = np.zeros_like(sim.u)
-    dvdx_shear = np.zeros_like(sim.v)
-    
-    dudx[1:-1, 1:-1] = (sim.u[1:-1, 2:] - sim.u[1:-1, :-2]) * 0.5
-    dvdy[1:-1, 1:-1] = (sim.v[2:, 1:-1] - sim.v[:-2, 1:-1]) * 0.5
-    dudy_shear[1:-1, 1:-1] = (sim.u[2:, 1:-1] - sim.u[:-2, 1:-1]) * 0.5
-    dvdx_shear[1:-1, 1:-1] = (sim.v[1:-1, 2:] - sim.v[1:-1, :-2]) * 0.5
-    
-    dynamic_viscosity = max(sim.viscosity * sim.density, 1e-8)
-    # Shear stress magnitude: sqrt(τ_xy^2 + τ_yy^2) near boundary
-    shear_stress = dynamic_viscosity * np.sqrt((dudy_shear + dvdx_shear)**2 + dvdy**2)
+    total_drag_n, pressure_drag_n, shear_drag_n, shear_stress = dynamics.compute_drag_components_n(sim)
 
-    if getattr(sim, "wall_distance", None) is None:
-        sim._update_wall_geometry()
-
-    obstacle = sim.obstacle_mask
-    wall_distance = np.array(sim.wall_distance, dtype=float) if sim.wall_distance is not None else np.full_like(obstacle, np.nan, dtype=float)
-    surface_band = (~obstacle) & np.isfinite(wall_distance) & (wall_distance > 0.0) & (wall_distance <= 1.5)
-
-    total_drag = 0.0
-    pressure_drag = 0.0
-    shear_drag = 0.0
-
-    if np.any(surface_band):
-        nx = -sim.wall_normal_x[surface_band]
-        ny = -sim.wall_normal_y[surface_band]
-        normal_mag = np.sqrt(nx**2 + ny**2)
-        valid = normal_mag > 1e-8
-        if np.any(valid):
-            nx = nx[valid] / normal_mag[valid]
-            ny = ny[valid] / normal_mag[valid]
-
-            p_local = pressure[surface_band][valid]
-
-            # Pressure traction on body: -p * n_out
-            pressure_force_x = -p_local * nx
-            pressure_force_y = -p_local * ny
-
-            tx = -ny
-            ty = nx
-            u_local = sim.u[surface_band][valid]
-            v_local = sim.v[surface_band][valid]
-            tangential_velocity = u_local * tx + v_local * ty
-
-            normal_distance = np.maximum(wall_distance[surface_band][valid], 1.0)
-            tangential_shear = dynamic_viscosity * tangential_velocity / normal_distance
-
-            # Shear force on body opposes local tangential fluid motion.
-            shear_force_x = -tangential_shear * tx
-            shear_force_y = -tangential_shear * ty
-
-            force_x = np.sum(pressure_force_x + shear_force_x)
-            force_y = np.sum(pressure_force_y + shear_force_y)
-
-            pressure_force_x_total = np.sum(pressure_force_x)
-            pressure_force_y_total = np.sum(pressure_force_y)
-            shear_force_x_total = np.sum(shear_force_x)
-            shear_force_y_total = np.sum(shear_force_y)
-
-            drag_direction = sim.freestream_direction
-            total_drag = float(force_x * drag_direction[0] + force_y * drag_direction[1])
-            pressure_drag = float(pressure_force_x_total * drag_direction[0] + pressure_force_y_total * drag_direction[1])
-            shear_drag = float(shear_force_x_total * drag_direction[0] + shear_force_y_total * drag_direction[1])
-
-    return speed, vorticity, total_drag, pressure_drag, shear_drag, pressure, streamwise_velocity, shear_stress
+    return speed, vorticity, total_drag_n, pressure_drag_n, shear_drag_n, pressure, streamwise_velocity, shear_stress
 
 # Initialise the fluid simulation
-grid_size = (300, 600)  # Height x Width
+grid_size = (200, 650)  # Height x Width
 viscosity = 0.0000018  # Lower diffusion to preserve wake structures
 density = 1.225  # Air density
 initial_relative_velocity = ambient_velocity_profile(0.0) - rocket_velocity_profile(0.0)
@@ -163,23 +118,29 @@ simulation = FluidSimulation(
     rocket_velocity_profile=rocket_velocity_profile,
     inflow_blend=0.02,
 )
+
 simulation.set_uniform_flow(freestream_speed, freestream_direction)
-
-# Small symmetry-breaking perturbation so vortex shedding can develop.
-_rng = np.random.default_rng(seed=42)
-_amp = 0.025 * freestream_speed
-simulation.u += _amp * _rng.standard_normal(grid_size)
-simulation.v += _amp * _rng.standard_normal(grid_size)
-simulation.u[simulation.obstacle_mask] = 0.0
-simulation.v[simulation.obstacle_mask] = 0.0
-
-rows, cols = grid_size
 
 rocket_center_x = grid_size[1] // 2
 rocket_center_y = grid_size[0] // 2
+simulation.add_rocket_profile(
+    rocket_profile=rocket,
+    center=(rocket_center_x, rocket_center_y),
+    body_fraction=rocket_body_fraction,
+    nose_points=rocket_nose_points,
+    fore_spike_fraction=rocket_fore_spike_fraction,
+    fore_spike_half_width_fraction=rocket_fore_spike_half_width_fraction,
+)
+
+rows, cols = grid_size
+
 profile_x, profile_y = rocket.get_2d_profile_polygon(
     center_x=rocket_center_x,
     center_y=rocket_center_y,
+    body_fraction=rocket_body_fraction,
+    nose_points=rocket_nose_points,
+    fore_spike_fraction=rocket_fore_spike_fraction,
+    fore_spike_half_width_fraction=rocket_fore_spike_half_width_fraction,
 )
 
 x = np.arange(grid_size[1], dtype=float)
@@ -206,12 +167,17 @@ precompute_start_time = time.perf_counter()
 update_progress_bar(0, num_frames, precompute_start_time)
 
 for frame_index in range(num_frames):
-    simulation.simulate_particles(steps=steps_per_frame)
+    for _ in range(steps_per_frame):
+        simulation.step_coupled(dynamics, dt=time_step)
+
     dx = simulation.u.copy()
     dy = simulation.v.copy()
     speed, vorticity, drag_total, drag_pressure, drag_shear, pressure, streamwise_velocity, shear_stress = compute_diagnostics(simulation)
     frame_time = simulation.simulation_time
     frame_speed = simulation.edge_speed
+    frame_thrust_n = float(dynamics.state.thrust_n)
+    frame_net_force_n = float(dynamics.state.net_force_n)
+    frame_rocket_speed_mps = float(dynamics.state.velocity_mps)
 
     dx[obstacle] = 0.0
     dy[obstacle] = 0.0
@@ -240,8 +206,24 @@ for frame_index in range(num_frames):
     if finite_shear.size > 0:
         global_max_shear = max(global_max_shear, float(np.max(finite_shear)))
 
-    frames.append((dx, dy, speed_plot, vorticity_plot, pressure_plot, streamwise_plot, shear_plot, frame_time, frame_speed, drag_total, drag_pressure, drag_shear))
-    drag_history.append((frame_speed, drag_total, drag_pressure, drag_shear))
+    frames.append((
+        dx,
+        dy,
+        speed_plot,
+        vorticity_plot,
+        pressure_plot,
+        streamwise_plot,
+        shear_plot,
+        frame_time,
+        frame_speed,
+        drag_total,
+        drag_pressure,
+        drag_shear,
+        frame_thrust_n,
+        frame_net_force_n,
+        frame_rocket_speed_mps,
+    ))
+    drag_history.append((frame_rocket_speed_mps, drag_total, drag_pressure, drag_shear, frame_thrust_n, frame_net_force_n))
     update_progress_bar(frame_index + 1, num_frames, precompute_start_time)
 
 if not np.isfinite(global_min_speed) or not np.isfinite(global_max_speed):
@@ -276,7 +258,23 @@ def draw_frame(frame_index):
     
     ax_drag.clear()
     
-    dx, dy, speed_plot, vorticity_plot, pressure_plot, streamwise_plot, shear_plot, frame_time, frame_speed, drag_total, drag_pressure, drag_shear = frames[frame_index]
+    (
+        dx,
+        dy,
+        speed_plot,
+        vorticity_plot,
+        pressure_plot,
+        streamwise_plot,
+        shear_plot,
+        frame_time,
+        frame_speed,
+        drag_total,
+        drag_pressure,
+        drag_shear,
+        frame_thrust_n,
+        frame_net_force_n,
+        frame_rocket_speed_mps,
+    ) = frames[frame_index]
 
     # Top-left: Velocity magnitude
     ax_speed.set_facecolor("white")
@@ -346,7 +344,7 @@ def draw_frame(frame_index):
     )
     ax_streamwise.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
     ax_streamwise.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
-    ax_streamwise.set(aspect=1, title="Streamwise Velocity (u)")
+    ax_streamwise.set(aspect=1, title="Streamwise Velocity")
     ax_streamwise.set_xlabel("X", fontsize=9)
     ax_streamwise.set_ylabel("Y", fontsize=9)
     ax_streamwise.set_xlim(0, cols - 1)
@@ -380,16 +378,20 @@ def draw_frame(frame_index):
     else:
         colorbars["vortex"].update_normal(im_vortex)
 
-    # Bottom-middle: Actual drag vs freestream velocity.
+    # Bottom-middle: Drag/thrust/net force vs rocket velocity.
     history_velocity = np.array([item[0] for item in drag_history[: frame_index + 1]], dtype=float)
     history_drag_total = np.array([item[1] for item in drag_history[: frame_index + 1]], dtype=float)
     history_drag_pressure = np.array([item[2] for item in drag_history[: frame_index + 1]], dtype=float)
     history_drag_shear = np.array([item[3] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_thrust = np.array([item[4] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_net = np.array([item[5] for item in drag_history[: frame_index + 1]], dtype=float)
 
     ax_drag.plot(history_velocity, history_drag_total, color="#1f77b4", linewidth=2.0, label="Total")
     ax_drag.plot(history_velocity, history_drag_pressure, color="#d62728", linewidth=1.3, linestyle="--", label="Pressure")
     ax_drag.plot(history_velocity, history_drag_shear, color="#2ca02c", linewidth=1.3, linestyle="--", label="Shear")
-    ax_drag.scatter([frame_speed], [drag_total], color="black", s=34, zorder=3)
+    ax_drag.plot(history_velocity, history_thrust, color="#9467bd", linewidth=1.5, linestyle=":", label="Thrust")
+    ax_drag.plot(history_velocity, history_net, color="#ff7f0e", linewidth=1.5, linestyle="-.", label="Net (T-D-W)")
+    ax_drag.scatter([frame_rocket_speed_mps], [drag_total], color="black", s=34, zorder=3)
 
     if history_velocity.size > 0:
         x_min = float(np.min(history_velocity))
@@ -399,15 +401,15 @@ def draw_frame(frame_index):
     else:
         ax_drag.set_xlim(0.0, 1.0)
 
-    combined_drag = np.concatenate((history_drag_total, history_drag_pressure, history_drag_shear)) if history_drag_total.size > 0 else np.array([0.0])
-    y_min = float(np.min(combined_drag))
-    y_max = float(np.max(combined_drag))
+    combined_forces = np.concatenate((history_drag_total, history_drag_pressure, history_drag_shear, history_thrust, history_net)) if history_drag_total.size > 0 else np.array([0.0])
+    y_min = float(np.min(combined_forces))
+    y_max = float(np.max(combined_forces))
     y_span = max(y_max - y_min, 1e-6)
     ax_drag.set_ylim(y_min - 0.1 * y_span, y_max + 0.1 * y_span)
-    ax_drag.set_ylabel("Drag (solver units)", fontsize=9)
-    ax_drag.set_xlabel("Freestream Velocity |U∞|", fontsize=9)
+    ax_drag.set_ylabel("Force (N)", fontsize=9)
+    ax_drag.set_xlabel("Rocket Speed (m/s)", fontsize=9)
     ax_drag.grid(True, alpha=0.3)
-    ax_drag.set_title("Actual Drag vs Velocity", fontsize=10)
+    ax_drag.set_title("Forces vs Velocity", fontsize=10)
     ax_drag.legend(fontsize=8, loc="best")
 
     # Bottom-right: Wall shear stress
@@ -434,9 +436,15 @@ def draw_frame(frame_index):
         colorbars["shear"].set_label("Pa", fontsize=8)
     else:
         colorbars["shear"].update_normal(im_shear)
+        
+    combined_speed = frame_speed + frame_rocket_speed_mps
 
     # Main title with time info
-    fig.suptitle(f"Rocket-Frame CFD Analysis | t={frame_time:.2f}s | U∞={frame_speed:.2f} m/s", fontsize=12, fontweight="bold")
+    fig.suptitle(
+        f"Rocket-Frame CFD Analysis | t={frame_time:.2f}s | U∞={frame_speed:.2f} (solver) | Vrocket={frame_rocket_speed_mps:.1f} m/s | Combined Speed={combined_speed:.2f} m/s",
+        fontsize=12,
+        fontweight="bold",
+    )
 
 draw_frame(0)
 

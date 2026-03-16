@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from typing import Callable
 from scipy.ndimage import map_coordinates
 
-from Functions import calculate_reynolds_number, calculate_drag_coefficient
+from Mechanisms.Functions import calculate_reynolds_number, calculate_drag_coefficient
 
 class FluidSimulation:
     """

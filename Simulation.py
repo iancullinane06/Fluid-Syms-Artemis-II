@@ -1,11 +1,11 @@
-from Classes import RocketProfile
+from Mechanisms.Classes import RocketProfile
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 from matplotlib.widgets import Slider
-from FluidSimulation import FluidSimulation
-from RocketDynamics import RocketDynamics
-from Graphing import format_duration, update_progress_bar
+from Mechanisms.FluidSimulation import FluidSimulation
+from Mechanisms.RocketDynamics import RocketDynamics
+from Mechanisms.Graphing import format_duration, update_progress_bar
 
 # Physics and display cadence are decoupled:
 # - small physics dt keeps advection/projection stable

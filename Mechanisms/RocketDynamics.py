@@ -5,7 +5,7 @@ from typing import Callable
 
 import numpy as np
 
-from FluidSimulation import FluidSimulation
+from Mechanisms.FluidSimulation import FluidSimulation
 
 
 @dataclass

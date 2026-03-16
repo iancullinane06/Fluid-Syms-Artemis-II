@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 
-from Classes import RocketProfile, AtmosphereState, FlightSample, NoseconeModel
-from Functions import calculate_drag_coefficient, calculate_reynolds_number
+from Mechanisms.Classes import RocketProfile, AtmosphereState, FlightSample, NoseconeModel
+from Mechanisms.Functions import calculate_drag_coefficient, calculate_reynolds_number
 
 G0 = 9.80665
 EARTH_RADIUS_M = 6_371_000.0

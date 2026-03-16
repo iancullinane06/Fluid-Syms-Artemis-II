@@ -1,5 +1,6 @@
 import time
 
+
 def format_duration(seconds: float) -> str:
     seconds = max(float(seconds), 0.0)
     minutes, secs = divmod(int(round(seconds)), 60)
@@ -18,7 +19,8 @@ def update_progress_bar(current: int, total: int, start_time: float, width: int 
     filled = int(round(width * fraction))
     bar = "#" * filled + "-" * (width - filled)
     elapsed = max(time.perf_counter() - start_time, 0.0)
-    eta_seconds = 0.0 if current <= 0 else elapsed * max(total - current, 0) / max(current, 1)
+    eta_seconds = 0.0 if current <= 0 else elapsed * \
+        max(total - current, 0) / max(current, 1)
     print(
         f"\rPrecomputing frames: [{bar}] {current}/{total} ({fraction * 100:5.1f}%) | ETA {format_duration(eta_seconds)}",
         end="",

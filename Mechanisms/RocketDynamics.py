@@ -35,8 +35,10 @@ class RocketDynamics:
         self.gravity_mps2 = float(max(gravity_mps2, 0.0))
         self.sim_speed_scale = float(max(sim_speed_scale, 1e-9))
         self.drag_force_scale_n = float(max(drag_force_scale_n, 1e-9))
-        self.dry_mass_kg = float(self.mass_kg if dry_mass_kg is None else np.clip(dry_mass_kg, 1e-6, self.mass_kg))
-        self.specific_impulse_s = None if specific_impulse_s is None else float(max(specific_impulse_s, 1e-6))
+        self.dry_mass_kg = float(self.mass_kg if dry_mass_kg is None else np.clip(
+            dry_mass_kg, 1e-6, self.mass_kg))
+        self.specific_impulse_s = None if specific_impulse_s is None else float(
+            max(specific_impulse_s, 1e-6))
         self.current_mass_kg = self.mass_kg
 
         direction = np.asarray(flight_direction, dtype=float)
@@ -45,7 +47,8 @@ class RocketDynamics:
             raise ValueError("flight_direction cannot be zero")
         self.flight_direction = direction / direction_norm
 
-        self.state = RocketState(mass_kg=self.current_mass_kg, thrust_n=float(self.thrust_profile(0.0)))
+        self.state = RocketState(
+            mass_kg=self.current_mass_kg, thrust_n=float(self.thrust_profile(0.0)))
 
     def rocket_velocity_profile(self, _: float) -> np.ndarray:
         speed_solver = self.state.velocity_mps * self.sim_speed_scale
@@ -62,7 +65,8 @@ class RocketDynamics:
         dudy_shear[1:-1, 1:-1] = (sim.u[2:, 1:-1] - sim.u[:-2, 1:-1]) * 0.5
         dvdx_shear[1:-1, 1:-1] = (sim.v[1:-1, 2:] - sim.v[1:-1, :-2]) * 0.5
         dvdy[1:-1, 1:-1] = (sim.v[2:, 1:-1] - sim.v[:-2, 1:-1]) * 0.5
-        shear_stress = dynamic_viscosity * np.sqrt((dudy_shear + dvdx_shear) ** 2 + dvdy ** 2)
+        shear_stress = dynamic_viscosity * \
+            np.sqrt((dudy_shear + dvdx_shear) ** 2 + dvdy ** 2)
 
         if getattr(sim, "wall_distance", None) is None:
             sim._update_wall_geometry()
@@ -107,7 +111,8 @@ class RocketDynamics:
                 # The force the fluid exerts on the body is in the direction of the near-wall
                 # tangential velocity (fluid drags the surface in the direction it flows).
                 # No minus sign — the shear force is +τ_w * t̂, not −τ_w * t̂.
-                normal_distance = np.maximum(wall_distance[surface_band][valid], 1.0)
+                normal_distance = np.maximum(
+                    wall_distance[surface_band][valid], 1.0)
                 tangential_shear = dynamic_viscosity * tangential_velocity / normal_distance
                 shear_force_x = tangential_shear * tx
                 shear_force_y = tangential_shear * ty
@@ -121,14 +126,18 @@ class RocketDynamics:
                 shear_force_y_total = np.sum(shear_force_y)
 
                 drag_direction = sim.freestream_direction
-                total_drag = float(force_x * drag_direction[0] + force_y * drag_direction[1])
-                pressure_drag = float(pressure_force_x_total * drag_direction[0] + pressure_force_y_total * drag_direction[1])
-                shear_drag = float(shear_force_x_total * drag_direction[0] + shear_force_y_total * drag_direction[1])
+                total_drag = float(
+                    force_x * drag_direction[0] + force_y * drag_direction[1])
+                pressure_drag = float(
+                    pressure_force_x_total * drag_direction[0] + pressure_force_y_total * drag_direction[1])
+                shear_drag = float(
+                    shear_force_x_total * drag_direction[0] + shear_force_y_total * drag_direction[1])
 
         return total_drag, pressure_drag, shear_drag, shear_stress
 
     def compute_drag_components_n(self, sim: FluidSimulation) -> tuple[float, float, float, np.ndarray]:
-        total_drag_solver, pressure_drag_solver, shear_drag_solver, shear_stress = self.compute_surface_force_components(sim)
+        total_drag_solver, pressure_drag_solver, shear_drag_solver, shear_stress = self.compute_surface_force_components(
+            sim)
         total_drag_n = total_drag_solver * self.drag_force_scale_n
         pressure_drag_n = pressure_drag_solver * self.drag_force_scale_n
         shear_drag_n = shear_drag_solver * self.drag_force_scale_n
@@ -146,8 +155,10 @@ class RocketDynamics:
             and thrust_n > 0.0
             and self.current_mass_kg > self.dry_mass_kg
         ):
-            mass_flow_kgps = thrust_n / (self.specific_impulse_s * self.gravity_mps2)
-            propellant_burn = min(mass_flow_kgps * dt, self.current_mass_kg - self.dry_mass_kg)
+            mass_flow_kgps = thrust_n / \
+                (self.specific_impulse_s * self.gravity_mps2)
+            propellant_burn = min(mass_flow_kgps * dt,
+                                  self.current_mass_kg - self.dry_mass_kg)
             self.current_mass_kg -= propellant_burn
 
         active_mass_kg = max(self.current_mass_kg, 1e-6)
@@ -159,5 +170,6 @@ class RocketDynamics:
         self.state.net_force_n = net_force_n
         self.state.acceleration_mps2 = acceleration
         self.state.mass_kg = active_mass_kg
-        self.state.velocity_mps = max(self.state.velocity_mps + acceleration * dt, 0.0)
+        self.state.velocity_mps = max(
+            self.state.velocity_mps + acceleration * dt, 0.0)
         return self.state

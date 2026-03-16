@@ -5,10 +5,12 @@ from scipy.ndimage import map_coordinates
 
 from Mechanisms.Functions import calculate_reynolds_number, calculate_drag_coefficient
 
+
 class FluidSimulation:
     """
     A 2D fluid simulation using a simplified Navier-Stokes solver.
     """
+
     def __init__(
         self,
         grid_size,
@@ -38,7 +40,7 @@ class FluidSimulation:
             time_step (float): Time step (s).
             density (float): Fluid density (kg/m^3).
             rocket_profile (RocketProfile, optional): Rocket profile object.
-            
+
         """
         self.grid_size = grid_size  # (nx, ny)
         self.viscosity = viscosity  # Kinematic viscosity (m^2/s)
@@ -47,11 +49,13 @@ class FluidSimulation:
         self.obstacle_mask = np.zeros(grid_size, dtype=bool)
         self.acceleration = acceleration  # Acceleration of particles (m/s^2)
         self.rocket_profile = rocket_profile
-        self.acceleration_direction = self._normalize_direction(acceleration_direction)
+        self.acceleration_direction = self._normalize_direction(
+            acceleration_direction)
         self.freestream_direction = self.acceleration_direction.copy()
         self.assume_laminar_edges = bool(assume_laminar_edges)
         self.edge_relaxation = float(np.clip(edge_relaxation, 0.0, 1.0))
-        self.edge_speed = 0.0 if edge_speed is None else float(max(edge_speed, 0.0))
+        self.edge_speed = 0.0 if edge_speed is None else float(
+            max(edge_speed, 0.0))
         self.wall_penalty = float(max(wall_penalty, 0.0))
         self.wall_shear_layers = max(int(wall_shear_layers), 1)
         self.turbulence_strength = float(max(turbulence_strength, 0.0))
@@ -79,7 +83,8 @@ class FluidSimulation:
         """Normalize a 2D direction vector."""
         direction_array = np.asarray(direction, dtype=float)
         if direction_array.shape != (2,):
-            raise ValueError("acceleration_direction must be a 2-element vector (x, y)")
+            raise ValueError(
+                "acceleration_direction must be a 2-element vector (x, y)")
 
         magnitude = np.linalg.norm(direction_array)
         if magnitude < 1e-12:
@@ -116,7 +121,8 @@ class FluidSimulation:
 
         candidate = np.asarray(profile(float(time_s)), dtype=float)
         if candidate.shape != (2,):
-            raise ValueError("Velocity profile must return a 2-element vector (vx, vy)")
+            raise ValueError(
+                "Velocity profile must return a 2-element vector (vx, vy)")
         return candidate
 
     def _update_reference_frame(self):
@@ -137,7 +143,8 @@ class FluidSimulation:
         self.relative_velocity_target = relative_velocity.copy()
 
         dt = max(float(self.time_step), 1e-8)
-        self.reference_acceleration_vector = (self.relative_velocity_target - previous_relative_velocity) / dt
+        self.reference_acceleration_vector = (
+            self.relative_velocity_target - previous_relative_velocity) / dt
 
         if speed > 1e-12:
             self.freestream_direction = relative_velocity / speed
@@ -172,7 +179,8 @@ class FluidSimulation:
 
         if mask is not None:
             if mask.shape != self.grid_size:
-                raise ValueError(f"mask shape {mask.shape} != grid_size {self.grid_size}")
+                raise ValueError(
+                    f"mask shape {mask.shape} != grid_size {self.grid_size}")
             self.obstacle_mask = mask.astype(bool)
             self._update_wall_geometry()
             return self.obstacle_mask
@@ -267,7 +275,8 @@ class FluidSimulation:
         if not np.any(boundary_layer):
             return
 
-        local_speed = np.mean(np.hypot(self.u[boundary_layer], self.v[boundary_layer]))
+        local_speed = np.mean(
+            np.hypot(self.u[boundary_layer], self.v[boundary_layer]))
         dynamic_viscosity = max(self.viscosity * self.density, 1e-8)
         characteristic_length = 1.0
         if self.rocket_profile is not None:
@@ -282,8 +291,10 @@ class FluidSimulation:
         drag_coefficient = calculate_drag_coefficient(reynolds_number)
 
         distance = wall_distance[boundary_layer]
-        wall_factor = 1.0 - np.clip((distance - 1.0) / max(self.wall_shear_layers, 1), 0.0, 1.0)
-        damping = np.clip((0.18 + 0.12 * drag_coefficient) * self.time_step * wall_factor, 0.0, 0.85)
+        wall_factor = 1.0 - \
+            np.clip((distance - 1.0) / max(self.wall_shear_layers, 1), 0.0, 1.0)
+        damping = np.clip((0.18 + 0.12 * drag_coefficient) *
+                          self.time_step * wall_factor, 0.0, 0.85)
 
         nx = self.wall_normal_x[boundary_layer].copy()
         ny = self.wall_normal_y[boundary_layer].copy()
@@ -307,8 +318,10 @@ class FluidSimulation:
         normal_velocity *= (1.0 - np.clip(1.35 * damping, 0.0, 0.92))
         tangential_velocity *= (1.0 - np.clip(0.85 * damping, 0.0, 0.85))
 
-        self.u[boundary_layer] = normal_velocity * nx + tangential_velocity * tx
-        self.v[boundary_layer] = normal_velocity * ny + tangential_velocity * ty
+        self.u[boundary_layer] = normal_velocity * \
+            nx + tangential_velocity * tx
+        self.v[boundary_layer] = normal_velocity * \
+            ny + tangential_velocity * ty
 
     def _apply_turbulence_model(self):
         """Simple LES-style eddy-viscosity closure plus vorticity confinement for wake roll-up."""
@@ -332,14 +345,17 @@ class FluidSimulation:
         if wall_distance is not None:
             near_wall = np.isfinite(wall_distance)
             wall_damping = np.ones_like(eddy_viscosity)
-            wall_damping[near_wall] = np.clip(wall_distance[near_wall] / max(self.wall_shear_layers, 1), 0.15, 1.0)
+            wall_damping[near_wall] = np.clip(
+                wall_distance[near_wall] / max(self.wall_shear_layers, 1), 0.15, 1.0)
             eddy_viscosity *= wall_damping
 
         effective_viscosity = self.viscosity + eddy_viscosity
         lap_u = self._laplacian(self.u)
         lap_v = self._laplacian(self.v)
-        self.u[fluid] += self.time_step * effective_viscosity[fluid] * lap_u[fluid]
-        self.v[fluid] += self.time_step * effective_viscosity[fluid] * lap_v[fluid]
+        self.u[fluid] += self.time_step * \
+            effective_viscosity[fluid] * lap_u[fluid]
+        self.v[fluid] += self.time_step * \
+            effective_viscosity[fluid] * lap_v[fluid]
 
         if self.vorticity_confinement <= 0.0:
             return
@@ -353,8 +369,10 @@ class FluidSimulation:
 
         confine_u = ny * vorticity
         confine_v = -nx * vorticity
-        self.u[fluid] += self.vorticity_confinement * self.time_step * confine_u[fluid]
-        self.v[fluid] += self.vorticity_confinement * self.time_step * confine_v[fluid]
+        self.u[fluid] += self.vorticity_confinement * \
+            self.time_step * confine_u[fluid]
+        self.v[fluid] += self.vorticity_confinement * \
+            self.time_step * confine_v[fluid]
 
     def _enforce_obstacle_boundary(self):
         """
@@ -476,7 +494,8 @@ class FluidSimulation:
         self._enforce_domain_boundary()   # seed inlet before advect
         self._enforce_obstacle_boundary()
         self._advect()
-        self._enforce_domain_boundary()   # restore inlet after advect wipes boundaries to zero
+        # restore inlet after advect wipes boundaries to zero
+        self._enforce_domain_boundary()
         self._enforce_obstacle_boundary()
         self._diffuse()
         self._enforce_domain_boundary()   # re-support inlet before pressure solve
@@ -514,13 +533,17 @@ class FluidSimulation:
         j_idx, i_idx = np.mgrid[1:rows - 1, 1:cols - 1]
         fluid = ~self.obstacle_mask[1:-1, 1:-1]
 
-        x_back = np.clip(i_idx - self.u[1:-1, 1:-1] * self.time_step, 0.0, cols - 1.0)
-        y_back = np.clip(j_idx - self.v[1:-1, 1:-1] * self.time_step, 0.0, rows - 1.0)
+        x_back = np.clip(i_idx - self.u[1:-1, 1:-1]
+                         * self.time_step, 0.0, cols - 1.0)
+        y_back = np.clip(j_idx - self.v[1:-1, 1:-1]
+                         * self.time_step, 0.0, rows - 1.0)
 
         # map_coordinates expects coordinates in (row, col) order.
         sample_coords = np.vstack((y_back.ravel(), x_back.ravel()))
-        u_interp = map_coordinates(self.u, sample_coords, order=1, mode="nearest").reshape(rows - 2, cols - 2)
-        v_interp = map_coordinates(self.v, sample_coords, order=1, mode="nearest").reshape(rows - 2, cols - 2)
+        u_interp = map_coordinates(
+            self.u, sample_coords, order=1, mode="nearest").reshape(rows - 2, cols - 2)
+        v_interp = map_coordinates(
+            self.v, sample_coords, order=1, mode="nearest").reshape(rows - 2, cols - 2)
 
         u_new = self.u.copy()
         v_new = self.v.copy()

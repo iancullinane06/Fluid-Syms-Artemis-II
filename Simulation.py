@@ -22,7 +22,8 @@ SIM_SPEED_SCALE = 1.0 / 80.0
 artemis_diameter_m = 8.4
 artemis_length_m = 98.0
 rocket_height_cells = 300  # Example value, adjust as needed
-rocket_width_cells = round(rocket_height_cells * (artemis_diameter_m / artemis_length_m), 1)
+rocket_width_cells = round(rocket_height_cells *
+                           (artemis_diameter_m / artemis_length_m), 1)
 rocket_body_fraction = 0.84
 rocket_nose_points = 96
 rocket_fore_spike_fraction = 0.08
@@ -40,8 +41,10 @@ rocket = RocketProfile(
 
 def thrust_profile_n(time_s: float) -> float:
     # Approximate Artemis II / SLS Block-1 thrust history.
-    time_knots_s = np.array([0.0, 8.0, 40.0, 80.0, 120.0, 126.0, 320.0, 500.0, 510.0, 700.0], dtype=float)
-    thrust_knots_n = np.array([39.0e6, 38.9e6, 38.5e6, 38.2e6, 37.8e6, 9.0e6, 8.9e6, 8.6e6, 0.0, 0.0], dtype=float)
+    time_knots_s = np.array(
+        [0.0, 8.0, 40.0, 80.0, 120.0, 126.0, 320.0, 500.0, 510.0, 700.0], dtype=float)
+    thrust_knots_n = np.array(
+        [39.0e6, 38.9e6, 38.5e6, 38.2e6, 37.8e6, 9.0e6, 8.9e6, 8.6e6, 0.0, 0.0], dtype=float)
     return float(np.interp(float(time_s), time_knots_s, thrust_knots_n))
 
 
@@ -54,6 +57,7 @@ dynamics = RocketDynamics(
     dry_mass_kg=900_000.0,
     specific_impulse_s=330.0,
 )
+
 
 def ambient_velocity_profile(time_s: float) -> np.ndarray:
     # Ambient wind in rocket frame should be small at liftoff; keep this mild so
@@ -87,18 +91,22 @@ def compute_diagnostics(sim: FluidSimulation):
         + sim.v * float(sim.freestream_direction[1])
     )
 
-    total_drag_n, pressure_drag_n, shear_drag_n, shear_stress = dynamics.compute_drag_components_n(sim)
+    total_drag_n, pressure_drag_n, shear_drag_n, shear_stress = dynamics.compute_drag_components_n(
+        sim)
 
     return speed, vorticity, total_drag_n, pressure_drag_n, shear_drag_n, pressure, streamwise_velocity, shear_stress
+
 
 # Initialise the fluid simulation
 grid_size = (200, 650)  # Height x Width
 viscosity = 0.0000018  # Lower diffusion to preserve wake structures
 density = 1.225  # Air density
-initial_relative_velocity = ambient_velocity_profile(0.0) - rocket_velocity_profile(0.0)
+initial_relative_velocity = ambient_velocity_profile(
+    0.0) - rocket_velocity_profile(0.0)
 initial_speed = float(np.linalg.norm(initial_relative_velocity))
 freestream_speed = max(initial_speed, 1e-6)
-freestream_direction = tuple((initial_relative_velocity / freestream_speed).tolist())
+freestream_direction = tuple(
+    (initial_relative_velocity / freestream_speed).tolist())
 simulation = FluidSimulation(
     grid_size,
     viscosity,
@@ -147,7 +155,8 @@ x = np.arange(grid_size[1], dtype=float)
 y = np.arange(grid_size[0], dtype=float)
 X, Y = np.meshgrid(x, y)
 
-quiver_stride = 16  # stride=16 on 400×400 keeps quiver density readable (~25×25 arrows)
+# stride=16 on 400×400 keeps quiver density readable (~25×25 arrows)
+quiver_stride = 16
 Xq = X[::quiver_stride, ::quiver_stride]
 Yq = Y[::quiver_stride, ::quiver_stride]
 
@@ -172,7 +181,8 @@ for frame_index in range(num_frames):
 
     dx = simulation.u.copy()
     dy = simulation.v.copy()
-    speed, vorticity, drag_total, drag_pressure, drag_shear, pressure, streamwise_velocity, shear_stress = compute_diagnostics(simulation)
+    speed, vorticity, drag_total, drag_pressure, drag_shear, pressure, streamwise_velocity, shear_stress = compute_diagnostics(
+        simulation)
     frame_time = simulation.simulation_time
     frame_speed = simulation.edge_speed
     frame_thrust_n = float(dynamics.state.thrust_n)
@@ -199,8 +209,10 @@ for frame_index in range(num_frames):
 
     finite_pressure = pressure_plot[np.isfinite(pressure_plot)]
     if finite_pressure.size > 0:
-        global_min_pressure = min(global_min_pressure, float(np.min(finite_pressure)))
-        global_max_pressure = max(global_max_pressure, float(np.max(finite_pressure)))
+        global_min_pressure = min(
+            global_min_pressure, float(np.min(finite_pressure)))
+        global_max_pressure = max(
+            global_max_pressure, float(np.max(finite_pressure)))
 
     finite_shear = shear_plot[np.isfinite(shear_plot)]
     if finite_shear.size > 0:
@@ -223,7 +235,8 @@ for frame_index in range(num_frames):
         frame_net_force_n,
         frame_rocket_speed_mps,
     ))
-    drag_history.append((frame_rocket_speed_mps, drag_total, drag_pressure, drag_shear, frame_thrust_n, frame_net_force_n))
+    drag_history.append((frame_rocket_speed_mps, drag_total,
+                        drag_pressure, drag_shear, frame_thrust_n, frame_net_force_n))
     update_progress_bar(frame_index + 1, num_frames, precompute_start_time)
 
 if not np.isfinite(global_min_speed) or not np.isfinite(global_max_speed):
@@ -238,7 +251,8 @@ fig_width = 16.0 * cols / max_dim
 fig_height = 10.8 * rows / max_dim
 fig = plt.figure(figsize=(fig_width, fig_height))
 fig.patch.set_facecolor("white")
-gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.30, bottom=0.12, top=0.95, left=0.08, right=0.96)
+gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.30,
+                      bottom=0.12, top=0.95, left=0.08, right=0.96)
 
 ax_speed = fig.add_subplot(gs[0, 0])
 ax_pressure = fig.add_subplot(gs[0, 1])
@@ -255,9 +269,9 @@ def draw_frame(frame_index):
     global colorbars, field_images
     for ax in [ax_speed, ax_pressure, ax_streamwise, ax_vortex, ax_shear]:
         ax.clear()
-    
+
     ax_drag.clear()
-    
+
     (
         dx,
         dy,
@@ -288,7 +302,8 @@ def draw_frame(frame_index):
         alpha=0.75,
         interpolation="bilinear",
     )
-    ax_speed.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
+    ax_speed.fill(profile_x, profile_y,
+                  color="cornflowerblue", alpha=0.35, zorder=6)
     ax_speed.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
     ax_speed.set(aspect=1, title="Velocity Magnitude")
     ax_speed.set_xlabel("X", fontsize=9)
@@ -296,7 +311,8 @@ def draw_frame(frame_index):
     ax_speed.set_xlim(0, cols - 1)
     ax_speed.set_ylim(0, rows - 1)
     if "speed" not in colorbars:
-        colorbars["speed"] = plt.colorbar(im_speed, ax=ax_speed, fraction=0.046, pad=0.04)
+        colorbars["speed"] = plt.colorbar(
+            im_speed, ax=ax_speed, fraction=0.046, pad=0.04)
         colorbars["speed"].set_label("m/s", fontsize=8)
     else:
         colorbars["speed"].update_normal(im_speed)
@@ -313,15 +329,18 @@ def draw_frame(frame_index):
         alpha=0.75,
         interpolation="bilinear",
     )
-    ax_pressure.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-    ax_pressure.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+    ax_pressure.fill(profile_x, profile_y,
+                     color="cornflowerblue", alpha=0.35, zorder=6)
+    ax_pressure.plot(profile_x, profile_y, color="blue",
+                     linewidth=1.5, zorder=7)
     ax_pressure.set(aspect=1, title="Pressure Field")
     ax_pressure.set_xlabel("X", fontsize=9)
     ax_pressure.set_ylabel("Y", fontsize=9)
     ax_pressure.set_xlim(0, cols - 1)
     ax_pressure.set_ylim(0, rows - 1)
     if "pressure" not in colorbars:
-        colorbars["pressure"] = plt.colorbar(im_pressure, ax=ax_pressure, fraction=0.046, pad=0.04)
+        colorbars["pressure"] = plt.colorbar(
+            im_pressure, ax=ax_pressure, fraction=0.046, pad=0.04)
         colorbars["pressure"].set_label("Pa", fontsize=8)
     else:
         colorbars["pressure"].update_normal(im_pressure)
@@ -342,15 +361,18 @@ def draw_frame(frame_index):
         alpha=0.75,
         interpolation="bilinear",
     )
-    ax_streamwise.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-    ax_streamwise.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+    ax_streamwise.fill(profile_x, profile_y,
+                       color="cornflowerblue", alpha=0.35, zorder=6)
+    ax_streamwise.plot(profile_x, profile_y, color="blue",
+                       linewidth=1.5, zorder=7)
     ax_streamwise.set(aspect=1, title="Streamwise Velocity")
     ax_streamwise.set_xlabel("X", fontsize=9)
     ax_streamwise.set_ylabel("Y", fontsize=9)
     ax_streamwise.set_xlim(0, cols - 1)
     ax_streamwise.set_ylim(0, rows - 1)
     if "streamwise" not in colorbars:
-        colorbars["streamwise"] = plt.colorbar(im_streamwise, ax=ax_streamwise, fraction=0.046, pad=0.04)
+        colorbars["streamwise"] = plt.colorbar(
+            im_streamwise, ax=ax_streamwise, fraction=0.046, pad=0.04)
         colorbars["streamwise"].set_label("m/s", fontsize=8)
     else:
         colorbars["streamwise"].update_normal(im_streamwise)
@@ -365,7 +387,8 @@ def draw_frame(frame_index):
         alpha=0.75,
         interpolation="bilinear",
     )
-    ax_vortex.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
+    ax_vortex.fill(profile_x, profile_y,
+                   color="cornflowerblue", alpha=0.35, zorder=6)
     ax_vortex.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
     ax_vortex.set(aspect=1, title="Vorticity Magnitude")
     ax_vortex.set_xlabel("X", fontsize=9)
@@ -373,25 +396,38 @@ def draw_frame(frame_index):
     ax_vortex.set_xlim(0, cols - 1)
     ax_vortex.set_ylim(0, rows - 1)
     if "vortex" not in colorbars:
-        colorbars["vortex"] = plt.colorbar(im_vortex, ax=ax_vortex, fraction=0.046, pad=0.04)
+        colorbars["vortex"] = plt.colorbar(
+            im_vortex, ax=ax_vortex, fraction=0.046, pad=0.04)
         colorbars["vortex"].set_label("1/s", fontsize=8)
     else:
         colorbars["vortex"].update_normal(im_vortex)
 
     # Bottom-middle: Drag/thrust/net force vs rocket velocity.
-    history_velocity = np.array([item[0] for item in drag_history[: frame_index + 1]], dtype=float)
-    history_drag_total = np.array([item[1] for item in drag_history[: frame_index + 1]], dtype=float)
-    history_drag_pressure = np.array([item[2] for item in drag_history[: frame_index + 1]], dtype=float)
-    history_drag_shear = np.array([item[3] for item in drag_history[: frame_index + 1]], dtype=float)
-    history_thrust = np.array([item[4] for item in drag_history[: frame_index + 1]], dtype=float)
-    history_net = np.array([item[5] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_velocity = np.array(
+        [item[0] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_drag_total = np.array(
+        [item[1] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_drag_pressure = np.array(
+        [item[2] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_drag_shear = np.array(
+        [item[3] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_thrust = np.array(
+        [item[4] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_net = np.array(
+        [item[5] for item in drag_history[: frame_index + 1]], dtype=float)
 
-    ax_drag.plot(history_velocity, history_drag_total, color="#1f77b4", linewidth=2.0, label="Total")
-    ax_drag.plot(history_velocity, history_drag_pressure, color="#d62728", linewidth=1.3, linestyle="--", label="Pressure")
-    ax_drag.plot(history_velocity, history_drag_shear, color="#2ca02c", linewidth=1.3, linestyle="--", label="Shear")
-    ax_drag.plot(history_velocity, history_thrust, color="#9467bd", linewidth=1.5, linestyle=":", label="Thrust")
-    ax_drag.plot(history_velocity, history_net, color="#ff7f0e", linewidth=1.5, linestyle="-.", label="Net (T-D-W)")
-    ax_drag.scatter([frame_rocket_speed_mps], [drag_total], color="black", s=34, zorder=3)
+    ax_drag.plot(history_velocity, history_drag_total,
+                 color="#1f77b4", linewidth=2.0, label="Total")
+    ax_drag.plot(history_velocity, history_drag_pressure,
+                 color="#d62728", linewidth=1.3, linestyle="--", label="Pressure")
+    ax_drag.plot(history_velocity, history_drag_shear,
+                 color="#2ca02c", linewidth=1.3, linestyle="--", label="Shear")
+    ax_drag.plot(history_velocity, history_thrust, color="#9467bd",
+                 linewidth=1.5, linestyle=":", label="Thrust")
+    ax_drag.plot(history_velocity, history_net, color="#ff7f0e",
+                 linewidth=1.5, linestyle="-.", label="Net (T-D-W)")
+    ax_drag.scatter([frame_rocket_speed_mps], [drag_total],
+                    color="black", s=34, zorder=3)
 
     if history_velocity.size > 0:
         x_min = float(np.min(history_velocity))
@@ -401,7 +437,8 @@ def draw_frame(frame_index):
     else:
         ax_drag.set_xlim(0.0, 1.0)
 
-    combined_forces = np.concatenate((history_drag_total, history_drag_pressure, history_drag_shear, history_thrust, history_net)) if history_drag_total.size > 0 else np.array([0.0])
+    combined_forces = np.concatenate((history_drag_total, history_drag_pressure, history_drag_shear,
+                                     history_thrust, history_net)) if history_drag_total.size > 0 else np.array([0.0])
     y_min = float(np.min(combined_forces))
     y_max = float(np.max(combined_forces))
     y_span = max(y_max - y_min, 1e-6)
@@ -424,7 +461,8 @@ def draw_frame(frame_index):
         alpha=0.75,
         interpolation="bilinear",
     )
-    ax_shear.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
+    ax_shear.fill(profile_x, profile_y,
+                  color="cornflowerblue", alpha=0.35, zorder=6)
     ax_shear.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
     ax_shear.set(aspect=1, title="Wall Shear Stress Magnitude")
     ax_shear.set_xlabel("X", fontsize=9)
@@ -432,11 +470,12 @@ def draw_frame(frame_index):
     ax_shear.set_xlim(0, cols - 1)
     ax_shear.set_ylim(0, rows - 1)
     if "shear" not in colorbars:
-        colorbars["shear"] = plt.colorbar(im_shear, ax=ax_shear, fraction=0.046, pad=0.04)
+        colorbars["shear"] = plt.colorbar(
+            im_shear, ax=ax_shear, fraction=0.046, pad=0.04)
         colorbars["shear"].set_label("Pa", fontsize=8)
     else:
         colorbars["shear"].update_normal(im_shear)
-        
+
     combined_speed = frame_speed + frame_rocket_speed_mps
 
     # Main title with time info
@@ -445,6 +484,7 @@ def draw_frame(frame_index):
         fontsize=12,
         fontweight="bold",
     )
+
 
 draw_frame(0)
 
@@ -457,6 +497,7 @@ time_slider = Slider(
     valinit=0,
     valstep=1,
 )
+
 
 def on_slider_change(value):
     frame_index = int(value)

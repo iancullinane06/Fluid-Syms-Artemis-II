@@ -13,6 +13,7 @@ def calculate_reynolds_number(density, velocity, characteristic_length, viscosit
     """
     return (density * velocity * characteristic_length) / viscosity
 
+
 def calculate_drag_coefficient(reynolds_number):
     """
     Estimate drag coefficient from Reynolds number for a streamlined body.
@@ -32,6 +33,7 @@ def calculate_drag_coefficient(reynolds_number):
     if re < 2.0e5:
         return 0.44
     return 0.2
+
 
 def calculate_gradient_coefficients(shape, material):
     """

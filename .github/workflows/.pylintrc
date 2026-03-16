@@ -1,0 +1,29 @@
+[MASTER]
+ignore=__pycache__,.venv
+
+[MESSAGES CONTROL]
+disable=
+    C0114,
+    C0115,
+    C0116,
+    C0301,
+    C0103,
+    C0104,
+    C0200,
+    C0411,
+    C0412,
+    R0902,
+    R0912,
+    R0913,
+    R0914,
+    R0915,
+    R0917,
+    R1705,
+    W0212,
+    W0602,
+    W0611,
+    W0612,
+    W0621
+
+[REPORTS]
+score=no

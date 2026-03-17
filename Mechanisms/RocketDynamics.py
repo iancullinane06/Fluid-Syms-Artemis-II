@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
 
+from Mechanisms.Classes import AtmosphereState
 from Mechanisms.FluidSimulation import FluidSimulation
 
 
@@ -20,6 +22,13 @@ class RocketState:
 
 
 class RocketDynamics:
+    EARTH_RADIUS_M = 6_371_000.0
+    R_AIR = 287.05287
+    GAMMA_AIR = 1.4
+    SUTHERLAND_REFERENCE_T = 273.15
+    SUTHERLAND_REFERENCE_MU = 1.716e-5
+    SUTHERLAND_S = 110.4
+
     def __init__(
         self,
         mass_kg: float,
@@ -41,6 +50,7 @@ class RocketDynamics:
         self.specific_impulse_s = None if specific_impulse_s is None else float(
             max(specific_impulse_s, 1e-6))
         self.current_mass_kg = self.mass_kg
+        self.reference_density_kg_m3 = 1.225
 
         direction = np.asarray(flight_direction, dtype=float)
         direction_norm = np.linalg.norm(direction)
@@ -50,6 +60,76 @@ class RocketDynamics:
 
         self.state = RocketState(
             mass_kg=self.current_mass_kg, thrust_n=float(self.thrust_profile(0.0)))
+
+    def _dynamic_viscosity_sutherland(self, temperature_k: float) -> float:
+        temperature = max(float(temperature_k), 1.0)
+        numerator = self.SUTHERLAND_REFERENCE_MU * \
+            (temperature / self.SUTHERLAND_REFERENCE_T) ** 1.5
+        return numerator * (self.SUTHERLAND_REFERENCE_T + self.SUTHERLAND_S) / (temperature + self.SUTHERLAND_S)
+
+    def atmosphere_at_altitude(self, altitude_m: float) -> AtmosphereState:
+        hb = np.array([0.0, 11_000.0, 20_000.0, 32_000.0,
+                      47_000.0, 51_000.0, 71_000.0, 84_852.0], dtype=float)
+        lapse = np.array([-0.0065, 0.0, 0.0010, 0.0028,
+                         0.0, -0.0028, -0.0020], dtype=float)
+
+        temperature_bases = [288.15]
+        pressure_bases = [101_325.0]
+
+        for index, lapse_rate in enumerate(lapse):
+            delta_h = hb[index + 1] - hb[index]
+            base_temperature = temperature_bases[index]
+            base_pressure = pressure_bases[index]
+
+            if abs(lapse_rate) < 1e-12:
+                next_temperature = base_temperature
+                exponent = -self.gravity_mps2 * delta_h / \
+                    (self.R_AIR * base_temperature)
+                next_pressure = base_pressure * math.exp(exponent)
+            else:
+                next_temperature = base_temperature + lapse_rate * delta_h
+                exponent = -self.gravity_mps2 / (lapse_rate * self.R_AIR)
+                next_pressure = base_pressure * \
+                    (next_temperature / base_temperature) ** exponent
+
+            temperature_bases.append(next_temperature)
+            pressure_bases.append(next_pressure)
+
+        altitude = float(np.clip(altitude_m, hb[0], hb[-1]))
+        layer = int(np.searchsorted(hb, altitude, side="right") - 1)
+        layer = min(layer, len(lapse) - 1)
+
+        base_altitude = hb[layer]
+        lapse_rate = lapse[layer]
+        base_temperature = temperature_bases[layer]
+        base_pressure = pressure_bases[layer]
+        delta_h = altitude - base_altitude
+
+        if abs(lapse_rate) < 1e-12:
+            temperature = base_temperature
+            pressure = base_pressure * \
+                math.exp(-self.gravity_mps2 * delta_h /
+                         (self.R_AIR * temperature))
+        else:
+            temperature = base_temperature + lapse_rate * delta_h
+            exponent = -self.gravity_mps2 / (lapse_rate * self.R_AIR)
+            pressure = base_pressure * (temperature / base_temperature) ** exponent
+
+        density = pressure / (self.R_AIR * temperature)
+        viscosity = self._dynamic_viscosity_sutherland(temperature)
+        speed_of_sound = math.sqrt(self.GAMMA_AIR * self.R_AIR * temperature)
+        gravity = self.gravity_mps2 * \
+            (self.EARTH_RADIUS_M / (self.EARTH_RADIUS_M + altitude)) ** 2
+
+        return AtmosphereState(
+            altitude_m=altitude,
+            temperature_k=temperature,
+            pressure_pa=pressure,
+            density_kg_m3=density,
+            dynamic_viscosity_pa_s=viscosity,
+            speed_of_sound_m_s=speed_of_sound,
+            gravity_m_s2=gravity,
+        )
 
     def rocket_velocity_profile(self, _: float) -> np.ndarray:
         speed_solver = self.state.velocity_mps * self.sim_speed_scale
@@ -136,12 +216,17 @@ class RocketDynamics:
     def compute_drag_components_n(self, sim: FluidSimulation) -> tuple[float, float, float, np.ndarray]:
         total_drag_solver, pressure_drag_solver, shear_drag_solver, shear_stress = self.compute_surface_force_components(
             sim)
-        total_drag_n = total_drag_solver * self.drag_force_scale_n
-        pressure_drag_n = pressure_drag_solver * self.drag_force_scale_n
-        shear_drag_n = shear_drag_solver * self.drag_force_scale_n
+        density_scale = float(max(sim.density, 1e-9) /
+                              max(self.reference_density_kg_m3, 1e-9))
+        total_drag_n = total_drag_solver * self.drag_force_scale_n * density_scale
+        pressure_drag_n = pressure_drag_solver * self.drag_force_scale_n * density_scale
+        shear_drag_n = shear_drag_solver * self.drag_force_scale_n * density_scale
         return total_drag_n, pressure_drag_n, shear_drag_n, shear_stress
 
     def integrate_step(self, sim: FluidSimulation, dt: float, time_s: float) -> RocketState:
+        atmosphere = self.atmosphere_at_altitude(self.state.altitude_m)
+        sim.density = max(float(atmosphere.density_kg_m3), 1e-8)
+
         total_drag_n, _, _, _ = self.compute_drag_components_n(sim)
         drag_n = max(float(total_drag_n), 0.0)
         thrust_n = float(self.thrust_profile(float(time_s)))
@@ -160,7 +245,7 @@ class RocketDynamics:
             self.current_mass_kg -= propellant_burn
 
         active_mass_kg = max(self.current_mass_kg, 1e-6)
-        net_force_n = thrust_n - drag_n - active_mass_kg * self.gravity_mps2
+        net_force_n = thrust_n - drag_n - active_mass_kg * atmosphere.gravity_m_s2
         acceleration = net_force_n / active_mass_kg
 
         self.state.thrust_n = thrust_n

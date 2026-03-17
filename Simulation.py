@@ -188,6 +188,7 @@ for frame_index in range(num_frames):
     frame_thrust_n = float(dynamics.state.thrust_n)
     frame_net_force_n = float(dynamics.state.net_force_n)
     frame_rocket_speed_mps = float(dynamics.state.velocity_mps)
+    frame_altitude_m = float(dynamics.state.altitude_m)
 
     dx[obstacle] = 0.0
     dy[obstacle] = 0.0
@@ -234,9 +235,10 @@ for frame_index in range(num_frames):
         frame_thrust_n,
         frame_net_force_n,
         frame_rocket_speed_mps,
+        frame_altitude_m,
     ))
-    drag_history.append((frame_rocket_speed_mps, drag_total,
-                        drag_pressure, drag_shear, frame_thrust_n, frame_net_force_n))
+    drag_history.append((frame_time, drag_total,
+                        drag_pressure, drag_shear, frame_thrust_n, frame_net_force_n, frame_altitude_m))
     update_progress_bar(frame_index + 1, num_frames, precompute_start_time)
 
 if not np.isfinite(global_min_speed) or not np.isfinite(global_max_speed):
@@ -259,6 +261,7 @@ ax_pressure = fig.add_subplot(gs[0, 1])
 ax_streamwise = fig.add_subplot(gs[0, 2])
 ax_vortex = fig.add_subplot(gs[1, 0])
 ax_drag = fig.add_subplot(gs[1, 1])
+ax_drag_altitude = ax_drag.twinx()
 ax_shear = fig.add_subplot(gs[1, 2])
 
 colorbars = {}
@@ -271,6 +274,7 @@ def draw_frame(frame_index):
         ax.clear()
 
     ax_drag.clear()
+    ax_drag_altitude.clear()
 
     (
         dx,
@@ -288,6 +292,7 @@ def draw_frame(frame_index):
         frame_thrust_n,
         frame_net_force_n,
         frame_rocket_speed_mps,
+        frame_altitude_m,
     ) = frames[frame_index]
 
     # Top-left: Velocity magnitude
@@ -402,8 +407,8 @@ def draw_frame(frame_index):
     else:
         colorbars["vortex"].update_normal(im_vortex)
 
-    # Bottom-middle: Drag/thrust/net force vs rocket velocity.
-    history_velocity = np.array(
+    # Bottom-middle: Drag/thrust/net force vs time, with altitude displacement.
+    history_time = np.array(
         [item[0] for item in drag_history[: frame_index + 1]], dtype=float)
     history_drag_total = np.array(
         [item[1] for item in drag_history[: frame_index + 1]], dtype=float)
@@ -415,23 +420,29 @@ def draw_frame(frame_index):
         [item[4] for item in drag_history[: frame_index + 1]], dtype=float)
     history_net = np.array(
         [item[5] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_altitude = np.array(
+        [item[6] for item in drag_history[: frame_index + 1]], dtype=float)
 
-    ax_drag.plot(history_velocity, history_drag_total,
+    ax_drag.plot(history_time, history_drag_total,
                  color="#1f77b4", linewidth=2.0, label="Total")
-    ax_drag.plot(history_velocity, history_drag_pressure,
+    ax_drag.plot(history_time, history_drag_pressure,
                  color="#d62728", linewidth=1.3, linestyle="--", label="Pressure")
-    ax_drag.plot(history_velocity, history_drag_shear,
+    ax_drag.plot(history_time, history_drag_shear,
                  color="#2ca02c", linewidth=1.3, linestyle="--", label="Shear")
-    ax_drag.plot(history_velocity, history_thrust, color="#9467bd",
+    ax_drag.plot(history_time, history_thrust, color="#9467bd",
                  linewidth=1.5, linestyle=":", label="Thrust")
-    ax_drag.plot(history_velocity, history_net, color="#ff7f0e",
+    ax_drag.plot(history_time, history_net, color="#ff7f0e",
                  linewidth=1.5, linestyle="-.", label="Net (T-D-W)")
-    ax_drag.scatter([frame_rocket_speed_mps], [drag_total],
+    ax_drag.scatter([frame_time], [drag_total],
                     color="black", s=34, zorder=3)
 
-    if history_velocity.size > 0:
-        x_min = float(np.min(history_velocity))
-        x_max = float(np.max(history_velocity))
+    ax_drag_altitude.plot(history_time, history_altitude, color="#111111",
+                          linewidth=1.4, linestyle="-", label="Altitude")
+    ax_drag_altitude.set_ylabel("Vertical Displacement (m)", fontsize=9)
+
+    if history_time.size > 0:
+        x_min = float(np.min(history_time))
+        x_max = float(np.max(history_time))
         x_pad = max(0.05 * (x_max - x_min), 1e-3)
         ax_drag.set_xlim(x_min - x_pad, x_max + x_pad)
     else:
@@ -444,10 +455,13 @@ def draw_frame(frame_index):
     y_span = max(y_max - y_min, 1e-6)
     ax_drag.set_ylim(y_min - 0.1 * y_span, y_max + 0.1 * y_span)
     ax_drag.set_ylabel("Force (N)", fontsize=9)
-    ax_drag.set_xlabel("Rocket Speed (m/s)", fontsize=9)
+    ax_drag.set_xlabel("Time (s)", fontsize=9)
     ax_drag.grid(True, alpha=0.3)
-    ax_drag.set_title("Forces vs Velocity", fontsize=10)
-    ax_drag.legend(fontsize=8, loc="best")
+    ax_drag.set_title("Forces & Vertical Displacement vs Time", fontsize=10)
+    force_handles, force_labels = ax_drag.get_legend_handles_labels()
+    altitude_handles, altitude_labels = ax_drag_altitude.get_legend_handles_labels()
+    ax_drag.legend(force_handles + altitude_handles,
+                   force_labels + altitude_labels, fontsize=8, loc="best")
 
     # Bottom-right: Wall shear stress
     ax_shear.set_facecolor("white")
@@ -476,11 +490,11 @@ def draw_frame(frame_index):
     else:
         colorbars["shear"].update_normal(im_shear)
 
-    combined_speed = frame_speed + frame_rocket_speed_mps
+    freestream_mps = frame_speed / SIM_SPEED_SCALE
 
     # Main title with time info
     fig.suptitle(
-        f"Rocket-Frame CFD Analysis | t={frame_time:.2f}s | U∞={frame_speed:.2f} (solver) | Vrocket={frame_rocket_speed_mps:.1f} m/s | Combined Speed={combined_speed:.2f} m/s",
+        f"Rocket-Frame CFD Analysis | t={frame_time:.2f}s | U∞={frame_speed:.2f} (solver) ≈ {freestream_mps:.1f} m/s | Vrocket={frame_rocket_speed_mps:.1f} m/s",
         fontsize=12,
         fontweight="bold",
     )

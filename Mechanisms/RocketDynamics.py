@@ -11,6 +11,7 @@ from Mechanisms.FluidSimulation import FluidSimulation
 @dataclass
 class RocketState:
     mass_kg: float = 0.0
+    altitude_m: float = 0.0
     velocity_mps: float = 0.0
     acceleration_mps2: float = 0.0
     thrust_n: float = 0.0
@@ -59,14 +60,19 @@ class RocketDynamics:
         pressure = sim.p
         dynamic_viscosity = max(sim.viscosity * sim.density, 1e-8)
 
-        dudy_shear = np.zeros_like(sim.u)
-        dvdx_shear = np.zeros_like(sim.v)
+        dudx = np.zeros_like(sim.u)
+        dudy = np.zeros_like(sim.u)
+        dvdx = np.zeros_like(sim.v)
         dvdy = np.zeros_like(sim.v)
-        dudy_shear[1:-1, 1:-1] = (sim.u[2:, 1:-1] - sim.u[:-2, 1:-1]) * 0.5
-        dvdx_shear[1:-1, 1:-1] = (sim.v[1:-1, 2:] - sim.v[1:-1, :-2]) * 0.5
+        dudx[1:-1, 1:-1] = (sim.u[1:-1, 2:] - sim.u[1:-1, :-2]) * 0.5
+        dudy[1:-1, 1:-1] = (sim.u[2:, 1:-1] - sim.u[:-2, 1:-1]) * 0.5
+        dvdx[1:-1, 1:-1] = (sim.v[1:-1, 2:] - sim.v[1:-1, :-2]) * 0.5
         dvdy[1:-1, 1:-1] = (sim.v[2:, 1:-1] - sim.v[:-2, 1:-1]) * 0.5
-        shear_stress = dynamic_viscosity * \
-            np.sqrt((dudy_shear + dvdx_shear) ** 2 + dvdy ** 2)
+
+        tau_xx = 2.0 * dynamic_viscosity * dudx
+        tau_yy = 2.0 * dynamic_viscosity * dvdy
+        tau_xy = dynamic_viscosity * (dudy + dvdx)
+        shear_stress = np.sqrt(tau_xx**2 + 2.0 * tau_xy**2 + tau_yy**2)
 
         if getattr(sim, "wall_distance", None) is None:
             sim._update_wall_geometry()
@@ -101,21 +107,13 @@ class RocketDynamics:
                 pressure_force_x = -p_local * nx
                 pressure_force_y = -p_local * ny
 
-                tx = -ny
-                ty = nx
-                u_local = sim.u[surface_band][valid]
-                v_local = sim.v[surface_band][valid]
-                tangential_velocity = u_local * tx + v_local * ty
+                tau_xx_local = tau_xx[surface_band][valid]
+                tau_xy_local = tau_xy[surface_band][valid]
+                tau_yy_local = tau_yy[surface_band][valid]
 
-                # Wall shear stress = μ * dV_tan/dn ≈ μ * V_tan / d  (assuming no-slip at wall)
-                # The force the fluid exerts on the body is in the direction of the near-wall
-                # tangential velocity (fluid drags the surface in the direction it flows).
-                # No minus sign — the shear force is +τ_w * t̂, not −τ_w * t̂.
-                normal_distance = np.maximum(
-                    wall_distance[surface_band][valid], 1.0)
-                tangential_shear = dynamic_viscosity * tangential_velocity / normal_distance
-                shear_force_x = tangential_shear * tx
-                shear_force_y = tangential_shear * ty
+                # Viscous traction vector: t_visc = τ · n
+                shear_force_x = tau_xx_local * nx + tau_xy_local * ny
+                shear_force_y = tau_xy_local * nx + tau_yy_local * ny
 
                 force_x = np.sum(pressure_force_x + shear_force_x)
                 force_y = np.sum(pressure_force_y + shear_force_y)
@@ -172,4 +170,6 @@ class RocketDynamics:
         self.state.mass_kg = active_mass_kg
         self.state.velocity_mps = max(
             self.state.velocity_mps + acceleration * dt, 0.0)
+        self.state.altitude_m = max(
+            0.0, self.state.altitude_m + self.state.velocity_mps * dt)
         return self.state

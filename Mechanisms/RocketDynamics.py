@@ -226,6 +226,16 @@ class RocketDynamics:
     def integrate_step(self, sim: FluidSimulation, dt: float, time_s: float) -> RocketState:
         atmosphere = self.atmosphere_at_altitude(self.state.altitude_m)
         sim.density = max(float(atmosphere.density_kg_m3), 1e-8)
+        sim.viscosity = max(
+            float(atmosphere.dynamic_viscosity_pa_s / max(atmosphere.density_kg_m3, 1e-8)),
+            1e-12,
+        )
+        if getattr(sim, "compressible", False):
+            sim.set_freestream_thermodynamics(
+                density=atmosphere.density_kg_m3,
+                temperature_k=atmosphere.temperature_k,
+                pressure_pa=atmosphere.pressure_pa,
+            )
 
         total_drag_n, _, _, _ = self.compute_drag_components_n(sim)
         drag_n = max(float(total_drag_n), 0.0)

@@ -10,13 +10,16 @@ from Mechanisms.Graphing import format_duration, update_progress_bar
 # Physics and display cadence are decoupled:
 # - small physics dt keeps advection/projection stable
 # - larger frame interval keeps animation length manageable
-time_step = 0.1
-sim_time = 250.0
-frame_interval = 1.0
-steps_per_frame = max(int(round(frame_interval / time_step)), 1)
+# - compressible mode may substep internally with a CFL-limited dt
+USE_COMPRESSIBLE = True
+time_step = 0.02 if USE_COMPRESSIBLE else 0.1
+sim_time = 30.0 if USE_COMPRESSIBLE else 250.0
+frame_interval = 0.5 if USE_COMPRESSIBLE else 1.0
 num_frames = int(sim_time / frame_interval)
 
-SIM_SPEED_SCALE = 1.0 / 80.0
+SIM_SPEED_SCALE = 1.0 if USE_COMPRESSIBLE else 1.0 / 80.0
+COMPRESSIBLE_BASE_MACH = 0.35
+COMPRESSIBLE_GUST_MACH = 0.025
 
 # Artemis-II-inspired slender profile proportions for the 2D silhouette.
 artemis_diameter_m = 8.4
@@ -58,12 +61,21 @@ dynamics = RocketDynamics(
     specific_impulse_s=330.0,
 )
 
+SEA_LEVEL_ATMOSPHERE = dynamics.atmosphere_at_altitude(0.0)
+
 
 def ambient_velocity_profile(time_s: float) -> np.ndarray:
-    # Ambient wind in rocket frame should be small at liftoff; keep this mild so
-    # initial relative speed does not start artificially high.
-    base_wind_mps = 4.0
-    gust_mps = 1.5 * np.sin(0.28 * time_s) + 0.8 * np.sin(0.92 * time_s + 0.35)
+    if USE_COMPRESSIBLE:
+        base_wind_mps = COMPRESSIBLE_BASE_MACH * \
+            SEA_LEVEL_ATMOSPHERE.speed_of_sound_m_s
+        gust_mps = COMPRESSIBLE_GUST_MACH * SEA_LEVEL_ATMOSPHERE.speed_of_sound_m_s * (
+            0.8 * np.sin(0.28 * time_s) + 0.4 * np.sin(0.92 * time_s + 0.35)
+        )
+    else:
+        # Ambient wind in rocket frame should be small at liftoff; keep this mild so
+        # initial relative speed does not start artificially high.
+        base_wind_mps = 4.0
+        gust_mps = 1.5 * np.sin(0.28 * time_s) + 0.8 * np.sin(0.92 * time_s + 0.35)
     wind_solver = (base_wind_mps + gust_mps) * SIM_SPEED_SCALE
     return np.array([-wind_solver, 0.0], dtype=float)
 
@@ -94,13 +106,31 @@ def compute_diagnostics(sim: FluidSimulation):
     total_drag_n, pressure_drag_n, shear_drag_n, shear_stress = dynamics.compute_drag_components_n(
         sim)
 
-    return speed, vorticity, total_drag_n, pressure_drag_n, shear_drag_n, pressure, streamwise_velocity, shear_stress
+    diagnostics = {
+        "speed": speed,
+        "pressure": pressure,
+        "streamwise_velocity": streamwise_velocity,
+        "vorticity": vorticity,
+        "density": sim.rho.copy() if sim.compressible else None,
+        "temperature": sim.temperature.copy() if sim.compressible else None,
+        "mach": sim.mach.copy() if sim.compressible else None,
+        "shear_stress": shear_stress,
+        "drag_total": total_drag_n,
+        "drag_pressure": pressure_drag_n,
+        "drag_shear": shear_drag_n,
+    }
+    return diagnostics
 
 
 # Initialise the fluid simulation
 grid_size = (200, 650)  # Height x Width
-viscosity = 0.0000018  # Lower diffusion to preserve wake structures
-density = 1.225  # Air density
+viscosity = (
+    SEA_LEVEL_ATMOSPHERE.dynamic_viscosity_pa_s /
+    SEA_LEVEL_ATMOSPHERE.density_kg_m3
+    if USE_COMPRESSIBLE
+    else 0.0000018
+)  # Kinematic viscosity (m^2/s)
+density = SEA_LEVEL_ATMOSPHERE.density_kg_m3 if USE_COMPRESSIBLE else 1.225
 initial_relative_velocity = ambient_velocity_profile(
     0.0) - rocket_velocity_profile(0.0)
 initial_speed = float(np.linalg.norm(initial_relative_velocity))
@@ -125,8 +155,16 @@ simulation = FluidSimulation(
     ambient_velocity_profile=ambient_velocity_profile,
     rocket_velocity_profile=rocket_velocity_profile,
     inflow_blend=0.02,
+    compressible=USE_COMPRESSIBLE,
+    reference_temperature=SEA_LEVEL_ATMOSPHERE.temperature_k,
 )
 
+if USE_COMPRESSIBLE:
+    simulation.set_freestream_thermodynamics(
+        density=SEA_LEVEL_ATMOSPHERE.density_kg_m3,
+        temperature_k=SEA_LEVEL_ATMOSPHERE.temperature_k,
+        pressure_pa=SEA_LEVEL_ATMOSPHERE.pressure_pa,
+    )
 simulation.set_uniform_flow(freestream_speed, freestream_direction)
 
 rocket_center_x = grid_size[1] // 2
@@ -170,38 +208,43 @@ global_min_speed = np.inf
 global_max_speed = -np.inf
 global_min_pressure = np.inf
 global_max_pressure = -np.inf
+global_min_density = np.inf
+global_max_density = -np.inf
+global_min_temperature = np.inf
+global_max_temperature = -np.inf
+global_min_mach = np.inf
+global_max_mach = -np.inf
 global_max_shear = -np.inf
 
 precompute_start_time = time.perf_counter()
 update_progress_bar(0, num_frames, precompute_start_time)
 
 for frame_index in range(num_frames):
-    for _ in range(steps_per_frame):
-        simulation.step_coupled(dynamics, dt=time_step)
+    target_time = min((frame_index + 1) * frame_interval, sim_time)
+    while simulation.simulation_time < target_time - 1e-12:
+        simulation.step_coupled(dynamics)
 
     dx = simulation.u.copy()
     dy = simulation.v.copy()
-    speed, vorticity, drag_total, drag_pressure, drag_shear, pressure, streamwise_velocity, shear_stress = compute_diagnostics(
-        simulation)
+    diagnostics = compute_diagnostics(simulation)
     frame_time = simulation.simulation_time
     frame_speed = simulation.edge_speed
     frame_thrust_n = float(dynamics.state.thrust_n)
     frame_net_force_n = float(dynamics.state.net_force_n)
     frame_rocket_speed_mps = float(dynamics.state.velocity_mps)
     frame_altitude_m = float(dynamics.state.altitude_m)
+    frame_freestream_mach = 0.0
+    if simulation.compressible:
+        local_atmosphere = dynamics.atmosphere_at_altitude(frame_altitude_m)
+        frame_freestream_mach = frame_speed / \
+            max(local_atmosphere.speed_of_sound_m_s, 1e-6)
 
     dx[obstacle] = 0.0
     dy[obstacle] = 0.0
-    speed_plot = speed.copy()
+    speed_plot = diagnostics["speed"].copy()
     speed_plot[obstacle] = np.nan
-    vorticity_plot = np.abs(vorticity)
-    vorticity_plot[obstacle] = np.nan
-    pressure_plot = pressure.copy()
+    pressure_plot = diagnostics["pressure"].copy()
     pressure_plot[obstacle] = np.nan
-    streamwise_plot = streamwise_velocity.copy()
-    streamwise_plot[obstacle] = np.nan
-    shear_plot = shear_stress.copy()
-    shear_plot[obstacle] = np.nan
 
     finite_speed = speed_plot[np.isfinite(speed_plot)]
     if finite_speed.size > 0:
@@ -215,36 +258,82 @@ for frame_index in range(num_frames):
         global_max_pressure = max(
             global_max_pressure, float(np.max(finite_pressure)))
 
-    finite_shear = shear_plot[np.isfinite(shear_plot)]
-    if finite_shear.size > 0:
-        global_max_shear = max(global_max_shear, float(np.max(finite_shear)))
+    frame_data = {
+        "dx": dx,
+        "dy": dy,
+        "speed_plot": speed_plot,
+        "pressure_plot": pressure_plot,
+        "frame_time": frame_time,
+        "frame_speed": frame_speed,
+        "frame_mach": frame_freestream_mach,
+        "drag_total": diagnostics["drag_total"],
+        "drag_pressure": diagnostics["drag_pressure"],
+        "drag_shear": diagnostics["drag_shear"],
+        "frame_thrust_n": frame_thrust_n,
+        "frame_net_force_n": frame_net_force_n,
+        "frame_rocket_speed_mps": frame_rocket_speed_mps,
+        "frame_altitude_m": frame_altitude_m,
+    }
 
-    frames.append((
-        dx,
-        dy,
-        speed_plot,
-        vorticity_plot,
-        pressure_plot,
-        streamwise_plot,
-        shear_plot,
-        frame_time,
-        frame_speed,
-        drag_total,
-        drag_pressure,
-        drag_shear,
-        frame_thrust_n,
-        frame_net_force_n,
-        frame_rocket_speed_mps,
-        frame_altitude_m,
-    ))
-    drag_history.append((frame_time, drag_total,
-                        drag_pressure, drag_shear, frame_thrust_n, frame_net_force_n, frame_altitude_m))
+    if simulation.compressible:
+        density_plot = diagnostics["density"].copy()
+        density_plot[obstacle] = np.nan
+        temperature_plot = diagnostics["temperature"].copy()
+        temperature_plot[obstacle] = np.nan
+        mach_plot = diagnostics["mach"].copy()
+        mach_plot[obstacle] = np.nan
+
+        finite_density = density_plot[np.isfinite(density_plot)]
+        if finite_density.size > 0:
+            global_min_density = min(global_min_density, float(np.min(finite_density)))
+            global_max_density = max(global_max_density, float(np.max(finite_density)))
+
+        finite_temperature = temperature_plot[np.isfinite(temperature_plot)]
+        if finite_temperature.size > 0:
+            global_min_temperature = min(
+                global_min_temperature, float(np.min(finite_temperature)))
+            global_max_temperature = max(
+                global_max_temperature, float(np.max(finite_temperature)))
+
+        finite_mach = mach_plot[np.isfinite(mach_plot)]
+        if finite_mach.size > 0:
+            global_min_mach = min(global_min_mach, float(np.min(finite_mach)))
+            global_max_mach = max(global_max_mach, float(np.max(finite_mach)))
+
+        frame_data["density_plot"] = density_plot
+        frame_data["temperature_plot"] = temperature_plot
+        frame_data["mach_plot"] = mach_plot
+    else:
+        streamwise_plot = diagnostics["streamwise_velocity"].copy()
+        streamwise_plot[obstacle] = np.nan
+        vorticity_plot = np.abs(diagnostics["vorticity"])
+        vorticity_plot[obstacle] = np.nan
+        shear_plot = diagnostics["shear_stress"].copy()
+        shear_plot[obstacle] = np.nan
+
+        finite_shear = shear_plot[np.isfinite(shear_plot)]
+        if finite_shear.size > 0:
+            global_max_shear = max(global_max_shear, float(np.max(finite_shear)))
+
+        frame_data["streamwise_plot"] = streamwise_plot
+        frame_data["vorticity_plot"] = vorticity_plot
+        frame_data["shear_plot"] = shear_plot
+
+    frames.append(frame_data)
+    drag_history.append((frame_time, diagnostics["drag_total"],
+                        diagnostics["drag_pressure"], diagnostics["drag_shear"], frame_thrust_n, frame_net_force_n, frame_altitude_m))
     update_progress_bar(frame_index + 1, num_frames, precompute_start_time)
 
 if not np.isfinite(global_min_speed) or not np.isfinite(global_max_speed):
     global_min_speed, global_max_speed = 0.0, 1.0
 if not np.isfinite(global_min_pressure) or not np.isfinite(global_max_pressure):
     global_min_pressure, global_max_pressure = -1.0, 1.0
+if not np.isfinite(global_min_density) or not np.isfinite(global_max_density):
+    global_min_density, global_max_density = 0.0, 1.0
+if not np.isfinite(global_min_temperature) or not np.isfinite(global_max_temperature):
+    global_min_temperature, global_max_temperature = 200.0, 400.0
+if not np.isfinite(global_min_mach) or not np.isfinite(global_max_mach):
+    global_min_mach, global_max_mach = 0.0, 1.0
 if not np.isfinite(global_max_shear):
     global_max_shear = 1.0
 
@@ -276,24 +365,19 @@ def draw_frame(frame_index):
     ax_drag.clear()
     ax_drag_altitude.clear()
 
-    (
-        dx,
-        dy,
-        speed_plot,
-        vorticity_plot,
-        pressure_plot,
-        streamwise_plot,
-        shear_plot,
-        frame_time,
-        frame_speed,
-        drag_total,
-        drag_pressure,
-        drag_shear,
-        frame_thrust_n,
-        frame_net_force_n,
-        frame_rocket_speed_mps,
-        frame_altitude_m,
-    ) = frames[frame_index]
+    frame = frames[frame_index]
+    speed_plot = frame["speed_plot"]
+    pressure_plot = frame["pressure_plot"]
+    frame_time = frame["frame_time"]
+    frame_speed = frame["frame_speed"]
+    frame_mach = frame["frame_mach"]
+    drag_total = frame["drag_total"]
+    drag_pressure = frame["drag_pressure"]
+    drag_shear = frame["drag_shear"]
+    frame_thrust_n = frame["frame_thrust_n"]
+    frame_net_force_n = frame["frame_net_force_n"]
+    frame_rocket_speed_mps = frame["frame_rocket_speed_mps"]
+    frame_altitude_m = frame["frame_altitude_m"]
 
     # Top-left: Velocity magnitude
     ax_speed.set_facecolor("white")
@@ -350,62 +434,125 @@ def draw_frame(frame_index):
     else:
         colorbars["pressure"].update_normal(im_pressure)
 
-    # Top-right: Streamwise velocity
-    ax_streamwise.set_facecolor("white")
-    # Use symmetric colormap centered on zero
-    streamwise_min = np.nanpercentile(streamwise_plot, 1)
-    streamwise_max = np.nanpercentile(streamwise_plot, 99)
-    streamwise_lim = max(abs(streamwise_min), abs(streamwise_max))
-    im_streamwise = ax_streamwise.imshow(
-        streamwise_plot,
-        origin="lower",
-        cmap="RdBu_r",
-        vmin=-streamwise_lim,
-        vmax=streamwise_lim,
-        extent=(0, cols - 1, 0, rows - 1),
-        alpha=0.75,
-        interpolation="bilinear",
-    )
-    ax_streamwise.fill(profile_x, profile_y,
-                       color="cornflowerblue", alpha=0.35, zorder=6)
-    ax_streamwise.plot(profile_x, profile_y, color="blue",
-                       linewidth=1.5, zorder=7)
-    ax_streamwise.set(aspect=1, title="Streamwise Velocity")
-    ax_streamwise.set_xlabel("X", fontsize=9)
-    ax_streamwise.set_ylabel("Y", fontsize=9)
-    ax_streamwise.set_xlim(0, cols - 1)
-    ax_streamwise.set_ylim(0, rows - 1)
-    if "streamwise" not in colorbars:
-        colorbars["streamwise"] = plt.colorbar(
-            im_streamwise, ax=ax_streamwise, fraction=0.046, pad=0.04)
-        colorbars["streamwise"].set_label("m/s", fontsize=8)
-    else:
-        colorbars["streamwise"].update_normal(im_streamwise)
+    if simulation.compressible:
+        mach_plot = frame["mach_plot"]
+        density_plot = frame["density_plot"]
+        temperature_plot = frame["temperature_plot"]
 
-    # Bottom-left: Vorticity
-    ax_vortex.set_facecolor("white")
-    im_vortex = ax_vortex.imshow(
-        vorticity_plot,
-        origin="lower",
-        cmap="Spectral",
-        extent=(0, cols - 1, 0, rows - 1),
-        alpha=0.75,
-        interpolation="bilinear",
-    )
-    ax_vortex.fill(profile_x, profile_y,
-                   color="cornflowerblue", alpha=0.35, zorder=6)
-    ax_vortex.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
-    ax_vortex.set(aspect=1, title="Vorticity Magnitude")
-    ax_vortex.set_xlabel("X", fontsize=9)
-    ax_vortex.set_ylabel("Y", fontsize=9)
-    ax_vortex.set_xlim(0, cols - 1)
-    ax_vortex.set_ylim(0, rows - 1)
-    if "vortex" not in colorbars:
-        colorbars["vortex"] = plt.colorbar(
-            im_vortex, ax=ax_vortex, fraction=0.046, pad=0.04)
-        colorbars["vortex"].set_label("1/s", fontsize=8)
+        # Top-right: Mach number
+        ax_streamwise.set_facecolor("white")
+        im_streamwise = ax_streamwise.imshow(
+            mach_plot,
+            origin="lower",
+            cmap="plasma",
+            vmin=global_min_mach,
+            vmax=global_max_mach,
+            extent=(0, cols - 1, 0, rows - 1),
+            alpha=0.75,
+            interpolation="bilinear",
+        )
+        ax_streamwise.fill(profile_x, profile_y,
+                           color="cornflowerblue", alpha=0.35, zorder=6)
+        ax_streamwise.plot(profile_x, profile_y, color="blue",
+                           linewidth=1.5, zorder=7)
+        ax_streamwise.set(aspect=1, title="Mach Number")
+        ax_streamwise.set_xlabel("X", fontsize=9)
+        ax_streamwise.set_ylabel("Y", fontsize=9)
+        ax_streamwise.set_xlim(0, cols - 1)
+        ax_streamwise.set_ylim(0, rows - 1)
+        if "streamwise" not in colorbars:
+            colorbars["streamwise"] = plt.colorbar(
+                im_streamwise, ax=ax_streamwise, fraction=0.046, pad=0.04)
+            colorbars["streamwise"].set_label("M", fontsize=8)
+        else:
+            colorbars["streamwise"].update_normal(im_streamwise)
+
+        # Bottom-left: Density
+        ax_vortex.set_facecolor("white")
+        im_vortex = ax_vortex.imshow(
+            density_plot,
+            origin="lower",
+            cmap="cividis",
+            vmin=global_min_density,
+            vmax=global_max_density,
+            extent=(0, cols - 1, 0, rows - 1),
+            alpha=0.75,
+            interpolation="bilinear",
+        )
+        ax_vortex.fill(profile_x, profile_y,
+                       color="cornflowerblue", alpha=0.35, zorder=6)
+        ax_vortex.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+        ax_vortex.set(aspect=1, title="Density Field")
+        ax_vortex.set_xlabel("X", fontsize=9)
+        ax_vortex.set_ylabel("Y", fontsize=9)
+        ax_vortex.set_xlim(0, cols - 1)
+        ax_vortex.set_ylim(0, rows - 1)
+        if "vortex" not in colorbars:
+            colorbars["vortex"] = plt.colorbar(
+                im_vortex, ax=ax_vortex, fraction=0.046, pad=0.04)
+            colorbars["vortex"].set_label("kg/m³", fontsize=8)
+        else:
+            colorbars["vortex"].update_normal(im_vortex)
     else:
-        colorbars["vortex"].update_normal(im_vortex)
+        streamwise_plot = frame["streamwise_plot"]
+        vorticity_plot = frame["vorticity_plot"]
+
+        # Top-right: Streamwise velocity
+        ax_streamwise.set_facecolor("white")
+        # Use symmetric colormap centered on zero
+        streamwise_min = np.nanpercentile(streamwise_plot, 1)
+        streamwise_max = np.nanpercentile(streamwise_plot, 99)
+        streamwise_lim = max(abs(streamwise_min), abs(streamwise_max))
+        im_streamwise = ax_streamwise.imshow(
+            streamwise_plot,
+            origin="lower",
+            cmap="RdBu_r",
+            vmin=-streamwise_lim,
+            vmax=streamwise_lim,
+            extent=(0, cols - 1, 0, rows - 1),
+            alpha=0.75,
+            interpolation="bilinear",
+        )
+        ax_streamwise.fill(profile_x, profile_y,
+                           color="cornflowerblue", alpha=0.35, zorder=6)
+        ax_streamwise.plot(profile_x, profile_y, color="blue",
+                           linewidth=1.5, zorder=7)
+        ax_streamwise.set(aspect=1, title="Streamwise Velocity")
+        ax_streamwise.set_xlabel("X", fontsize=9)
+        ax_streamwise.set_ylabel("Y", fontsize=9)
+        ax_streamwise.set_xlim(0, cols - 1)
+        ax_streamwise.set_ylim(0, rows - 1)
+        if "streamwise" not in colorbars:
+            colorbars["streamwise"] = plt.colorbar(
+                im_streamwise, ax=ax_streamwise, fraction=0.046, pad=0.04)
+            colorbars["streamwise"].set_label("m/s", fontsize=8)
+        else:
+            colorbars["streamwise"].update_normal(im_streamwise)
+
+        # Bottom-left: Vorticity
+        ax_vortex.set_facecolor("white")
+        im_vortex = ax_vortex.imshow(
+            vorticity_plot,
+            origin="lower",
+            cmap="Spectral",
+            extent=(0, cols - 1, 0, rows - 1),
+            alpha=0.75,
+            interpolation="bilinear",
+        )
+        ax_vortex.fill(profile_x, profile_y,
+                       color="cornflowerblue", alpha=0.35, zorder=6)
+        ax_vortex.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+        ax_vortex.set(aspect=1, title="Vorticity Magnitude")
+        ax_vortex.set_xlabel("X", fontsize=9)
+        ax_vortex.set_ylabel("Y", fontsize=9)
+        ax_vortex.set_xlim(0, cols - 1)
+        ax_vortex.set_ylim(0, rows - 1)
+        if "vortex" not in colorbars:
+            colorbars["vortex"] = plt.colorbar(
+                im_vortex, ax=ax_vortex, fraction=0.046, pad=0.04)
+            colorbars["vortex"].set_label("1/s", fontsize=8)
+        else:
+            colorbars["vortex"].update_normal(im_vortex)
 
     # Bottom-middle: Drag/thrust/net force vs time, with altitude displacement.
     history_time = np.array(
@@ -463,41 +610,80 @@ def draw_frame(frame_index):
     ax_drag.legend(force_handles + altitude_handles,
                    force_labels + altitude_labels, fontsize=8, loc="best")
 
-    # Bottom-right: Wall shear stress
-    ax_shear.set_facecolor("white")
-    im_shear = ax_shear.imshow(
-        shear_plot,
-        origin="lower",
-        cmap="hot",
-        vmin=0.0,
-        vmax=global_max_shear,
-        extent=(0, cols - 1, 0, rows - 1),
-        alpha=0.75,
-        interpolation="bilinear",
-    )
-    ax_shear.fill(profile_x, profile_y,
-                  color="cornflowerblue", alpha=0.35, zorder=6)
-    ax_shear.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
-    ax_shear.set(aspect=1, title="Wall Shear Stress Magnitude")
-    ax_shear.set_xlabel("X", fontsize=9)
-    ax_shear.set_ylabel("Y", fontsize=9)
-    ax_shear.set_xlim(0, cols - 1)
-    ax_shear.set_ylim(0, rows - 1)
-    if "shear" not in colorbars:
-        colorbars["shear"] = plt.colorbar(
-            im_shear, ax=ax_shear, fraction=0.046, pad=0.04)
-        colorbars["shear"].set_label("Pa", fontsize=8)
+    if simulation.compressible:
+        temperature_plot = frame["temperature_plot"]
+
+        # Bottom-right: Temperature
+        ax_shear.set_facecolor("white")
+        im_shear = ax_shear.imshow(
+            temperature_plot,
+            origin="lower",
+            cmap="inferno",
+            vmin=global_min_temperature,
+            vmax=global_max_temperature,
+            extent=(0, cols - 1, 0, rows - 1),
+            alpha=0.75,
+            interpolation="bilinear",
+        )
+        ax_shear.fill(profile_x, profile_y,
+                      color="cornflowerblue", alpha=0.35, zorder=6)
+        ax_shear.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+        ax_shear.set(aspect=1, title="Temperature Field")
+        ax_shear.set_xlabel("X", fontsize=9)
+        ax_shear.set_ylabel("Y", fontsize=9)
+        ax_shear.set_xlim(0, cols - 1)
+        ax_shear.set_ylim(0, rows - 1)
+        if "shear" not in colorbars:
+            colorbars["shear"] = plt.colorbar(
+                im_shear, ax=ax_shear, fraction=0.046, pad=0.04)
+            colorbars["shear"].set_label("K", fontsize=8)
+        else:
+            colorbars["shear"].update_normal(im_shear)
     else:
-        colorbars["shear"].update_normal(im_shear)
+        shear_plot = frame["shear_plot"]
+
+        # Bottom-right: Wall shear stress
+        ax_shear.set_facecolor("white")
+        im_shear = ax_shear.imshow(
+            shear_plot,
+            origin="lower",
+            cmap="hot",
+            vmin=0.0,
+            vmax=global_max_shear,
+            extent=(0, cols - 1, 0, rows - 1),
+            alpha=0.75,
+            interpolation="bilinear",
+        )
+        ax_shear.fill(profile_x, profile_y,
+                      color="cornflowerblue", alpha=0.35, zorder=6)
+        ax_shear.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+        ax_shear.set(aspect=1, title="Wall Shear Stress Magnitude")
+        ax_shear.set_xlabel("X", fontsize=9)
+        ax_shear.set_ylabel("Y", fontsize=9)
+        ax_shear.set_xlim(0, cols - 1)
+        ax_shear.set_ylim(0, rows - 1)
+        if "shear" not in colorbars:
+            colorbars["shear"] = plt.colorbar(
+                im_shear, ax=ax_shear, fraction=0.046, pad=0.04)
+            colorbars["shear"].set_label("Pa", fontsize=8)
+        else:
+            colorbars["shear"].update_normal(im_shear)
 
     freestream_mps = frame_speed / SIM_SPEED_SCALE
 
     # Main title with time info
-    fig.suptitle(
-        f"Rocket-Frame CFD Analysis | t={frame_time:.2f}s | U∞={frame_speed:.2f} (solver) ≈ {freestream_mps:.1f} m/s | Vrocket={frame_rocket_speed_mps:.1f} m/s",
-        fontsize=12,
-        fontweight="bold",
-    )
+    if simulation.compressible:
+        fig.suptitle(
+            f"Rocket-Frame Compressible CFD | t={frame_time:.2f}s | U∞={frame_speed:.1f} m/s | M∞≈{frame_mach:.2f} | Vrocket={frame_rocket_speed_mps:.1f} m/s",
+            fontsize=12,
+            fontweight="bold",
+        )
+    else:
+        fig.suptitle(
+            f"Rocket-Frame CFD Analysis | t={frame_time:.2f}s | U∞={frame_speed:.2f} (solver) ≈ {freestream_mps:.1f} m/s | Vrocket={frame_rocket_speed_mps:.1f} m/s",
+            fontsize=12,
+            fontweight="bold",
+        )
 
 
 draw_frame(0)

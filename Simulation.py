@@ -843,7 +843,7 @@ def save_simulation_video():
             animation.save(str(mp4_path), writer=writer, dpi=VIDEO_DPI)
             print(f"Saved video: {mp4_path}")
             saved_mp4 = True
-        except Exception as exc:
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
             print(f"FFmpeg export failed ({exc}).")
     else:
         print("FFmpeg executable not found (set FFMPEG_PATH or install ffmpeg).")

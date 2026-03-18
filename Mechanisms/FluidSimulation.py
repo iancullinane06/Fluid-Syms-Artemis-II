@@ -29,6 +29,15 @@ class FluidSimulation:
         ambient_velocity_profile: Callable[[float], np.ndarray] | None = None,
         rocket_velocity_profile: Callable[[float], np.ndarray] | None = None,
         inflow_blend=0.03,
+        compressible=False,
+        gamma=1.4,
+        gas_constant=287.05287,
+        reference_temperature=288.15,
+        cfl_number=0.45,
+        density_floor=1e-4,
+        pressure_floor=1.0,
+        compressible_velocity_diffusion=0.0,
+        compressible_flux_scheme="hllc",
     ):
         """
         Initialize the fluid simulation.
@@ -63,20 +72,60 @@ class FluidSimulation:
         self.ambient_velocity_profile = ambient_velocity_profile
         self.rocket_velocity_profile = rocket_velocity_profile
         self.inflow_blend = float(np.clip(inflow_blend, 0.0, 1.0))
+        self.compressible = bool(compressible)
+        self.gamma = float(max(gamma, 1.0001))
+        self.gas_constant = float(max(gas_constant, 1e-8))
+        self.reference_temperature = float(max(reference_temperature, 1.0))
+        self.cfl_number = float(np.clip(cfl_number, 0.05, 0.95))
+        self.density_floor = float(max(density_floor, 1e-8))
+        self.pressure_floor = float(max(pressure_floor, 1e-8))
+        self.compressible_velocity_diffusion = float(
+            max(compressible_velocity_diffusion, 0.0))
+        flux_name = str(compressible_flux_scheme).strip().lower()
+        if flux_name not in {"hllc", "rusanov"}:
+            raise ValueError(
+                "compressible_flux_scheme must be 'hllc' or 'rusanov'")
+        self.compressible_flux_scheme = flux_name
         self.base_ambient_velocity = self.edge_speed * self.freestream_direction
         self.relative_velocity_target = self.base_ambient_velocity.copy()
         self.reference_acceleration_vector = np.zeros(2, dtype=float)
         self.wall_distance = None
         self.wall_normal_x = np.zeros(grid_size, dtype=float)
         self.wall_normal_y = np.zeros(grid_size, dtype=float)
+        self.last_step_dt = self.time_step
+        self.freestream_density = float(max(self.density, self.density_floor))
+        self.freestream_temperature = self.reference_temperature
+        self.freestream_pressure = float(max(
+            self.freestream_density * self.gas_constant * self.freestream_temperature,
+            self.pressure_floor,
+        ))
 
         # Initialize velocity and pressure fields
         self.u = np.zeros(grid_size)  # x-velocity
         self.v = np.zeros(grid_size)  # y-velocity
         self.p = np.zeros(grid_size)  # Pressure field
+        self.rho = np.full(grid_size, self.freestream_density, dtype=float)
+        self.rho_u = np.zeros(grid_size, dtype=float)
+        self.rho_v = np.zeros(grid_size, dtype=float)
+        self.energy = np.full(
+            grid_size,
+            self.freestream_pressure / (self.gamma - 1.0),
+            dtype=float,
+        )
+        self.temperature = np.full(
+            grid_size, self.freestream_temperature, dtype=float)
+        self.sound_speed = np.full(
+            grid_size,
+            np.sqrt(self.gamma * self.freestream_pressure / self.freestream_density),
+            dtype=float,
+        )
+        self.mach = np.zeros(grid_size, dtype=float)
 
         if self.rocket_profile is not None:
             self.add_rocket_profile(self.rocket_profile)
+
+        if self.compressible:
+            self._sync_conservative_from_primitive()
 
     def _normalize_direction(self, direction):
         """Normalize a 2D direction vector."""
@@ -110,8 +159,53 @@ class FluidSimulation:
         self.reference_acceleration_vector.fill(0.0)
         self.u[:, :] = flow_speed * float(direction_vector[0])
         self.v[:, :] = flow_speed * float(direction_vector[1])
+        if self.compressible:
+            self.rho[:, :] = self.freestream_density
+            self.p[:, :] = self.freestream_pressure
+            self.temperature[:, :] = self.freestream_temperature
+            self._sync_conservative_from_primitive()
         self._enforce_obstacle_boundary()
         self._enforce_domain_boundary()
+
+    def set_freestream_thermodynamics(self, density=None, temperature_k=None, pressure_pa=None):
+        """Update the reference thermodynamic state used by compressible boundaries."""
+        rho = self.freestream_density if density is None else float(
+            max(density, self.density_floor))
+        temperature = self.freestream_temperature if temperature_k is None else float(
+            max(temperature_k, 1.0))
+        pressure = self.freestream_pressure if pressure_pa is None else float(
+            max(pressure_pa, self.pressure_floor))
+
+        if density is not None and temperature_k is not None and pressure_pa is None:
+            pressure = max(rho * self.gas_constant * temperature, self.pressure_floor)
+        elif density is not None and pressure_pa is not None and temperature_k is None:
+            temperature = max(pressure / (rho * self.gas_constant), 1.0)
+        elif temperature_k is not None and pressure_pa is not None and density is None:
+            rho = max(pressure / (self.gas_constant * temperature), self.density_floor)
+
+        self.freestream_density = rho
+        self.freestream_temperature = temperature
+        self.freestream_pressure = pressure
+
+    def set_freestream_mach(self, mach_number, direction=None, temperature_k=None, pressure_pa=None, density=None):
+        """Convenience helper for compressible setups based on Mach number."""
+        self.set_freestream_thermodynamics(
+            density=density,
+            temperature_k=temperature_k,
+            pressure_pa=pressure_pa,
+        )
+        sound_speed = np.sqrt(
+            self.gamma * self.freestream_pressure / self.freestream_density)
+        self.set_uniform_flow(float(max(mach_number, 0.0)) * sound_speed, direction)
+
+    def get_conservative_fields(self):
+        """Return copies of the conservative variables for inspection or debugging."""
+        return {
+            "rho": self.rho.copy(),
+            "rho_u": self.rho_u.copy(),
+            "rho_v": self.rho_v.copy(),
+            "energy": self.energy.copy(),
+        }
 
     def _resolve_profile_velocity(self, profile, time_s, default_velocity):
         """Evaluate a velocity profile callback if present, otherwise return default velocity."""
@@ -153,12 +247,508 @@ class FluidSimulation:
             # Blending every cell each step injects uniform divergence that looks like
             # source/sink nodes all over the domain.
 
+    def _update_scalar_density(self):
+        """Keep legacy scalar density in sync with the mean fluid density field."""
+        fluid = ~self.obstacle_mask
+        if np.any(fluid):
+            self.density = float(max(np.mean(self.rho[fluid]), self.density_floor))
+        else:
+            self.density = float(max(np.mean(self.rho), self.density_floor))
+
+    def _sync_conservative_from_primitive(self):
+        """Rebuild conservative variables from primitive fields."""
+        self.rho = np.where(np.isfinite(self.rho), self.rho,
+                            self.freestream_density)
+        self.rho = np.maximum(self.rho, self.density_floor)
+
+        invalid_pressure = (~np.isfinite(self.p)) | (self.p <= self.pressure_floor)
+        if np.any(invalid_pressure):
+            self.p[invalid_pressure] = np.maximum(
+                self.rho[invalid_pressure] * self.gas_constant * self.temperature[invalid_pressure],
+                self.pressure_floor,
+            )
+
+        invalid_temperature = (~np.isfinite(self.temperature)) | (self.temperature <= 1.0)
+        if np.any(invalid_temperature):
+            self.temperature[invalid_temperature] = np.maximum(
+                self.p[invalid_temperature]
+                / (self.rho[invalid_temperature] * self.gas_constant),
+                1.0,
+            )
+
+        self.rho_u = self.rho * self.u
+        self.rho_v = self.rho * self.v
+        kinetic_energy = 0.5 * self.rho * (self.u**2 + self.v**2)
+        internal_energy = np.maximum(
+            self.p / (self.gamma - 1.0),
+            self.pressure_floor / (self.gamma - 1.0),
+        )
+        self.energy = internal_energy + kinetic_energy
+        self.sound_speed = np.sqrt(self.gamma * self.p / self.rho)
+        self.mach = np.hypot(self.u, self.v) / np.maximum(self.sound_speed, 1e-8)
+        self._update_scalar_density()
+
+    def _sync_primitive_from_conservative(self):
+        """Recover primitive variables from conservative fields."""
+        self.rho = np.where(np.isfinite(self.rho), self.rho,
+                            self.freestream_density)
+        self.rho = np.maximum(self.rho, self.density_floor)
+
+        self.u = np.divide(
+            self.rho_u,
+            self.rho,
+            out=np.zeros_like(self.rho_u),
+            where=self.rho > self.density_floor,
+        )
+        self.v = np.divide(
+            self.rho_v,
+            self.rho,
+            out=np.zeros_like(self.rho_v),
+            where=self.rho > self.density_floor,
+        )
+
+        kinetic_energy = 0.5 * self.rho * (self.u**2 + self.v**2)
+        internal_energy = np.maximum(
+            self.energy - kinetic_energy,
+            self.pressure_floor / (self.gamma - 1.0),
+        )
+        self.p = np.maximum((self.gamma - 1.0) * internal_energy,
+                            self.pressure_floor)
+        self.temperature = np.maximum(
+            self.p / (self.rho * self.gas_constant),
+            1.0,
+        )
+        self.sound_speed = np.sqrt(self.gamma * self.p / self.rho)
+        self.mach = np.hypot(self.u, self.v) / np.maximum(self.sound_speed, 1e-8)
+        self._update_scalar_density()
+
+    def _conservative_state(self):
+        """Pack conservative fields into a single array for flux updates."""
+        return np.stack((self.rho, self.rho_u, self.rho_v, self.energy), axis=0)
+
+    def _pressure_from_state(self, state):
+        """Equation of state for conservative variables."""
+        rho = np.maximum(state[0], self.density_floor)
+        momentum_sq = state[1] ** 2 + state[2] ** 2
+        kinetic_energy = 0.5 * momentum_sq / rho
+        internal_energy = np.maximum(
+            state[3] - kinetic_energy,
+            self.pressure_floor / (self.gamma - 1.0),
+        )
+        return np.maximum((self.gamma - 1.0) * internal_energy,
+                          self.pressure_floor)
+
+    def _sound_speed_from_state(self, state):
+        """Local sound speed for a conservative state array."""
+        rho = np.maximum(state[0], self.density_floor)
+        pressure = self._pressure_from_state(state)
+        return np.sqrt(self.gamma * pressure / rho)
+
+    def _compute_stable_time_step(self):
+        """Compute a conservative CFL-limited time step for compressible updates."""
+        if not self.compressible:
+            return self.time_step
+
+        fluid = ~self.obstacle_mask
+        if not np.any(fluid):
+            return self.time_step
+
+        signal_speed_x = np.abs(self.u) + self.sound_speed
+        signal_speed_y = np.abs(self.v) + self.sound_speed
+        max_signal = float(max(
+            np.max(signal_speed_x[fluid]),
+            np.max(signal_speed_y[fluid]),
+            1e-8,
+        ))
+        return float(max(min(self.time_step, self.cfl_number / max_signal), 1e-6))
+
+    def _euler_flux(self, state, axis):
+        """Compute inviscid Euler fluxes in the selected axis."""
+        rho = np.maximum(state[0], self.density_floor)
+        mx = state[1]
+        my = state[2]
+        energy = state[3]
+        pressure = self._pressure_from_state(state)
+        u = mx / rho
+        v = my / rho
+
+        if axis == 0:
+            return np.stack((
+                mx,
+                mx * u + pressure,
+                my * u,
+                (energy + pressure) * u,
+            ), axis=0)
+
+        return np.stack((
+            my,
+            mx * v,
+            my * v + pressure,
+            (energy + pressure) * v,
+        ), axis=0)
+
+    def _rusanov_flux(self, left_state, right_state, axis):
+        """Local Lax-Friedrichs/Rusanov interface flux."""
+        left_flux = self._euler_flux(left_state, axis)
+        right_flux = self._euler_flux(right_state, axis)
+
+        rho_left = np.maximum(left_state[0], self.density_floor)
+        rho_right = np.maximum(right_state[0], self.density_floor)
+        sound_left = self._sound_speed_from_state(left_state)
+        sound_right = self._sound_speed_from_state(right_state)
+
+        if axis == 0:
+            velocity_left = np.abs(left_state[1] / rho_left)
+            velocity_right = np.abs(right_state[1] / rho_right)
+        else:
+            velocity_left = np.abs(left_state[2] / rho_left)
+            velocity_right = np.abs(right_state[2] / rho_right)
+
+        s_max = np.maximum(velocity_left + sound_left,
+                           velocity_right + sound_right)
+        return 0.5 * (left_flux + right_flux) - 0.5 * s_max[None, ...] * (right_state - left_state)
+
+    def _hllc_flux(self, left_state, right_state, axis):
+        """HLLC approximate Riemann flux for 2D Euler states across one axis-aligned face."""
+        flux_left = self._euler_flux(left_state, axis)
+        flux_right = self._euler_flux(right_state, axis)
+
+        rho_left = np.maximum(left_state[0], self.density_floor)
+        rho_right = np.maximum(right_state[0], self.density_floor)
+        pressure_left = self._pressure_from_state(left_state)
+        pressure_right = self._pressure_from_state(right_state)
+        sound_left = self._sound_speed_from_state(left_state)
+        sound_right = self._sound_speed_from_state(right_state)
+
+        if axis == 0:
+            normal_momentum_left = left_state[1]
+            normal_momentum_right = right_state[1]
+            tangential_momentum_left = left_state[2]
+            tangential_momentum_right = right_state[2]
+        else:
+            normal_momentum_left = left_state[2]
+            normal_momentum_right = right_state[2]
+            tangential_momentum_left = left_state[1]
+            tangential_momentum_right = right_state[1]
+
+        normal_velocity_left = normal_momentum_left / rho_left
+        normal_velocity_right = normal_momentum_right / rho_right
+        tangential_velocity_left = tangential_momentum_left / rho_left
+        tangential_velocity_right = tangential_momentum_right / rho_right
+
+        wave_speed_left = np.minimum(
+            normal_velocity_left - sound_left,
+            normal_velocity_right - sound_right,
+        )
+        wave_speed_right = np.maximum(
+            normal_velocity_left + sound_left,
+            normal_velocity_right + sound_right,
+        )
+
+        denominator = (
+            rho_left * (wave_speed_left - normal_velocity_left)
+            - rho_right * (wave_speed_right - normal_velocity_right)
+        )
+        denominator = np.where(np.abs(denominator) < 1e-8, 1e-8, denominator)
+        contact_speed = (
+            pressure_right
+            - pressure_left
+            + rho_left * normal_velocity_left * (wave_speed_left - normal_velocity_left)
+            - rho_right * normal_velocity_right * (wave_speed_right - normal_velocity_right)
+        ) / denominator
+
+        pressure_star_left = pressure_left + rho_left * \
+            (wave_speed_left - normal_velocity_left) * \
+            (contact_speed - normal_velocity_left)
+        pressure_star_right = pressure_right + rho_right * \
+            (wave_speed_right - normal_velocity_right) * \
+            (contact_speed - normal_velocity_right)
+        pressure_star = np.maximum(
+            0.5 * (pressure_star_left + pressure_star_right),
+            self.pressure_floor,
+        )
+
+        denom_left_star = wave_speed_left - contact_speed
+        denom_right_star = wave_speed_right - contact_speed
+        denom_left_star = np.where(np.abs(denom_left_star) < 1e-8, 1e-8, denom_left_star)
+        denom_right_star = np.where(np.abs(denom_right_star) < 1e-8, 1e-8, denom_right_star)
+
+        rho_star_left = rho_left * \
+            (wave_speed_left - normal_velocity_left) / denom_left_star
+        rho_star_right = rho_right * \
+            (wave_speed_right - normal_velocity_right) / denom_right_star
+
+        energy_left = left_state[3]
+        energy_right = right_state[3]
+        energy_star_left = (
+            (wave_speed_left - normal_velocity_left) * energy_left
+            - pressure_left * normal_velocity_left
+            + pressure_star * contact_speed
+        ) / denom_left_star
+        energy_star_right = (
+            (wave_speed_right - normal_velocity_right) * energy_right
+            - pressure_right * normal_velocity_right
+            + pressure_star * contact_speed
+        ) / denom_right_star
+
+        normal_momentum_star_left = rho_star_left * contact_speed
+        normal_momentum_star_right = rho_star_right * contact_speed
+        tangential_momentum_star_left = rho_star_left * tangential_velocity_left
+        tangential_momentum_star_right = rho_star_right * tangential_velocity_right
+
+        star_left = np.zeros_like(left_state)
+        star_right = np.zeros_like(right_state)
+        star_left[0] = rho_star_left
+        star_right[0] = rho_star_right
+
+        if axis == 0:
+            star_left[1] = normal_momentum_star_left
+            star_left[2] = tangential_momentum_star_left
+            star_right[1] = normal_momentum_star_right
+            star_right[2] = tangential_momentum_star_right
+        else:
+            star_left[1] = tangential_momentum_star_left
+            star_left[2] = normal_momentum_star_left
+            star_right[1] = tangential_momentum_star_right
+            star_right[2] = normal_momentum_star_right
+
+        star_left[3] = energy_star_left
+        star_right[3] = energy_star_right
+
+        flux = flux_right.copy()
+        mask_left = wave_speed_left >= 0.0
+        mask_left_star = (wave_speed_left < 0.0) & (contact_speed >= 0.0)
+        mask_right_star = (contact_speed < 0.0) & (wave_speed_right >= 0.0)
+
+        if np.any(mask_left):
+            flux[:, mask_left] = flux_left[:, mask_left]
+        if np.any(mask_left_star):
+            flux[:, mask_left_star] = (
+                flux_left[:, mask_left_star]
+                + wave_speed_left[mask_left_star][None, :]
+                * (star_left[:, mask_left_star] - left_state[:, mask_left_star])
+            )
+        if np.any(mask_right_star):
+            flux[:, mask_right_star] = (
+                flux_right[:, mask_right_star]
+                + wave_speed_right[mask_right_star][None, :]
+                * (star_right[:, mask_right_star] - right_state[:, mask_right_star])
+            )
+
+        return flux
+
+    def _interface_flux(self, left_state, right_state, axis):
+        """Dispatch interface flux computation for compressible Euler updates."""
+        if self.compressible_flux_scheme == "hllc":
+            return self._hllc_flux(left_state, right_state, axis)
+        return self._rusanov_flux(left_state, right_state, axis)
+
+    def _advance_compressible_euler(self, dt):
+        """Advance one first-order finite-volume Euler step using dimensional splitting."""
+        state = self._conservative_state()
+        updated = state.copy()
+
+        if self.grid_size[1] > 2:
+            flux_x = self._interface_flux(state[:, :, :-1], state[:, :, 1:], axis=0)
+            updated[:, :, 1:-1] -= dt * (flux_x[:, :, 1:] - flux_x[:, :, :-1])
+
+        state_y = updated.copy()
+        if self.grid_size[0] > 2:
+            flux_y = self._interface_flux(state_y[:, :-1, :], state_y[:, 1:, :], axis=1)
+            state_y[:, 1:-1, :] -= dt * (flux_y[:, 1:, :] - flux_y[:, :-1, :])
+
+        if np.any(self.obstacle_mask):
+            obstacle = self.obstacle_mask
+            state_y[0, obstacle] = np.maximum(state[0, obstacle], self.density_floor)
+            state_y[1, obstacle] = 0.0
+            state_y[2, obstacle] = 0.0
+            state_y[3, obstacle] = np.maximum(
+                state[3, obstacle],
+                self.freestream_pressure / (self.gamma - 1.0),
+            )
+
+        self.rho = state_y[0]
+        self.rho_u = state_y[1]
+        self.rho_v = state_y[2]
+        self.energy = state_y[3]
+        self._sync_primitive_from_conservative()
+
+    def _enforce_compressible_domain_boundary(self):
+        """Directional inflow/outflow boundary conditions for the compressible branch."""
+        if not self.assume_laminar_edges:
+            self.u[0, :] = self.u[1, :]
+            self.u[-1, :] = self.u[-2, :]
+            self.v[:, 0] = self.v[:, 1]
+            self.v[:, -1] = self.v[:, -2]
+            self.v[0, :] = 0.0
+            self.v[-1, :] = 0.0
+            self.u[:, 0] = 0.0
+            self.u[:, -1] = 0.0
+            self.rho[0, :] = self.rho[1, :]
+            self.rho[-1, :] = self.rho[-2, :]
+            self.rho[:, 0] = self.rho[:, 1]
+            self.rho[:, -1] = self.rho[:, -2]
+            self.p[0, :] = self.p[1, :]
+            self.p[-1, :] = self.p[-2, :]
+            self.p[:, 0] = self.p[:, 1]
+            self.p[:, -1] = self.p[:, -2]
+            self.temperature = np.maximum(
+                self.p / (self.rho * self.gas_constant),
+                1.0,
+            )
+            self._sync_conservative_from_primitive()
+            return
+
+        target_u = self.edge_speed * self.freestream_direction[0]
+        target_v = self.edge_speed * self.freestream_direction[1]
+        target_rho = self.freestream_density
+        target_p = self.freestream_pressure
+        beta = self.edge_relaxation
+
+        if abs(self.freestream_direction[0]) >= abs(self.freestream_direction[1]):
+            if self.freestream_direction[0] <= 0.0:
+                self.rho[:, -1] = beta * target_rho + (1.0 - beta) * self.rho[:, -2]
+                self.u[:, -1] = beta * target_u + (1.0 - beta) * self.u[:, -2]
+                self.v[:, -1] = beta * target_v + (1.0 - beta) * self.v[:, -2]
+                self.p[:, -1] = beta * target_p + (1.0 - beta) * self.p[:, -2]
+
+                self.rho[:, 0] = self.rho[:, 1]
+                self.u[:, 0] = self.u[:, 1]
+                self.v[:, 0] = self.v[:, 1]
+                self.p[:, 0] = self.p[:, 1]
+            else:
+                self.rho[:, 0] = beta * target_rho + (1.0 - beta) * self.rho[:, 1]
+                self.u[:, 0] = beta * target_u + (1.0 - beta) * self.u[:, 1]
+                self.v[:, 0] = beta * target_v + (1.0 - beta) * self.v[:, 1]
+                self.p[:, 0] = beta * target_p + (1.0 - beta) * self.p[:, 1]
+
+                self.rho[:, -1] = self.rho[:, -2]
+                self.u[:, -1] = self.u[:, -2]
+                self.v[:, -1] = self.v[:, -2]
+                self.p[:, -1] = self.p[:, -2]
+
+            self.rho[0, :] = self.rho[1, :]
+            self.rho[-1, :] = self.rho[-2, :]
+            self.p[0, :] = self.p[1, :]
+            self.p[-1, :] = self.p[-2, :]
+            self.u[0, :] = self.u[1, :]
+            self.u[-1, :] = self.u[-2, :]
+            self.v[0, :] = 0.0
+            self.v[-1, :] = 0.0
+        else:
+            if self.freestream_direction[1] >= 0.0:
+                self.rho[0, :] = beta * target_rho + (1.0 - beta) * self.rho[1, :]
+                self.u[0, :] = beta * target_u + (1.0 - beta) * self.u[1, :]
+                self.v[0, :] = beta * target_v + (1.0 - beta) * self.v[1, :]
+                self.p[0, :] = beta * target_p + (1.0 - beta) * self.p[1, :]
+
+                self.rho[-1, :] = self.rho[-2, :]
+                self.u[-1, :] = self.u[-2, :]
+                self.v[-1, :] = self.v[-2, :]
+                self.p[-1, :] = self.p[-2, :]
+            else:
+                self.rho[-1, :] = beta * target_rho + (1.0 - beta) * self.rho[-2, :]
+                self.u[-1, :] = beta * target_u + (1.0 - beta) * self.u[-2, :]
+                self.v[-1, :] = beta * target_v + (1.0 - beta) * self.v[-2, :]
+                self.p[-1, :] = beta * target_p + (1.0 - beta) * self.p[-2, :]
+
+                self.rho[0, :] = self.rho[1, :]
+                self.u[0, :] = self.u[1, :]
+                self.v[0, :] = self.v[1, :]
+                self.p[0, :] = self.p[1, :]
+
+            self.rho[:, 0] = self.rho[:, 1]
+            self.rho[:, -1] = self.rho[:, -2]
+            self.p[:, 0] = self.p[:, 1]
+            self.p[:, -1] = self.p[:, -2]
+            self.u[:, 0] = 0.0
+            self.u[:, -1] = 0.0
+            self.v[:, 0] = self.v[:, 1]
+            self.v[:, -1] = self.v[:, -2]
+
+        self.temperature = np.maximum(
+            self.p / (self.rho * self.gas_constant),
+            1.0,
+        )
+        self._sync_conservative_from_primitive()
+
+    def _apply_compressible_obstacle_state(self):
+        """Populate obstacle cells with quiescent thermodynamic states for the compressible branch."""
+        obstacle = getattr(self, "obstacle_mask", None)
+        if obstacle is None or not np.any(obstacle):
+            return
+
+        fluid = ~obstacle
+        ghost_cells = obstacle & self._dilate_mask(fluid)
+        rows, cols = self.grid_size
+
+        if np.any(ghost_cells):
+            for gy, gx in np.argwhere(ghost_cells):
+                y0 = max(gy - 1, 0)
+                y1 = min(gy + 2, rows)
+                x0 = max(gx - 1, 0)
+                x1 = min(gx + 2, cols)
+                local_fluid = fluid[y0:y1, x0:x1]
+                if np.any(local_fluid):
+                    self.rho[gy, gx] = max(
+                        float(np.mean(self.rho[y0:y1, x0:x1][local_fluid])),
+                        self.density_floor,
+                    )
+                    self.p[gy, gx] = max(
+                        float(np.mean(self.p[y0:y1, x0:x1][local_fluid])),
+                        self.pressure_floor,
+                    )
+                else:
+                    self.rho[gy, gx] = self.freestream_density
+                    self.p[gy, gx] = self.freestream_pressure
+
+        deep_interior = obstacle & ~ghost_cells
+        if np.any(deep_interior):
+            self.rho[deep_interior] = self.freestream_density
+            self.p[deep_interior] = self.freestream_pressure
+
+        self.u[obstacle] = 0.0
+        self.v[obstacle] = 0.0
+        self.temperature[obstacle] = np.maximum(
+            self.p[obstacle] / (self.rho[obstacle] * self.gas_constant),
+            1.0,
+        )
+        self.rho_u[obstacle] = 0.0
+        self.rho_v[obstacle] = 0.0
+        self.energy[obstacle] = self.p[obstacle] / (self.gamma - 1.0)
+
+    def _step_compressible(self):
+        """Advance the compressible branch using a simple first-order finite-volume update."""
+        local_dt = self._compute_stable_time_step()
+        self._apply_body_force(dt=local_dt)
+        self._enforce_domain_boundary()
+        self._enforce_obstacle_boundary()
+        self._advance_compressible_euler(local_dt)
+
+        # Optional extra smoothing for difficult setups.
+        # Default is OFF because first-order Rusanov already introduces strong
+        # numerical diffusion; adding implicit velocity diffusion here can wipe
+        # out wake structures and smear shock features.
+        if self.compressible_velocity_diffusion > 0.0:
+            original_viscosity = self.viscosity
+            self.viscosity = self.compressible_velocity_diffusion
+            self._diffuse(dt=local_dt)
+            self.viscosity = original_viscosity
+            self._sync_conservative_from_primitive()
+
+        self._enforce_obstacle_boundary()
+        self._enforce_domain_boundary()
+        self.last_step_dt = local_dt
+        self.simulation_time += local_dt
+
     def add_source(self, x, y, strength):
         """
         Add a velocity source at a specific location.
         """
         self.u[y, x] += strength[0]
         self.v[y, x] += strength[1]
+        if self.compressible:
+            self._sync_conservative_from_primitive()
 
     def add_rocket_profile(
         self,
@@ -428,6 +1018,9 @@ class FluidSimulation:
         """
         Immersed-boundary no-slip treatment using ghost-cell reconstruction.
         """
+        if self.compressible:
+            self._apply_compressible_obstacle_state()
+            return
         self._apply_ghost_cell_reconstruction()
 
     def _dilate_mask(self, mask):
@@ -446,7 +1039,7 @@ class FluidSimulation:
         dilated = center | up | down | left | right | up_left | up_right | down_left | down_right
         return dilated
 
-    def _apply_body_force(self):
+    def _apply_body_force(self, dt=None):
         """Apply uniform body-force acceleration to fluid cells.
 
         Two sources are combined:
@@ -457,16 +1050,34 @@ class FluidSimulation:
         if not np.any(fluid):
             return
 
+        step_dt = self.time_step if dt is None else float(dt)
+
         acceleration_vector = self.reference_acceleration_vector.copy()
         if self.acceleration != 0.0:
             acceleration_vector += self.acceleration * self.acceleration_direction
 
-        accel_step = acceleration_vector * self.time_step
+        if self.compressible:
+            mom_x = self.rho_u.copy()
+            mom_y = self.rho_v.copy()
+            self.rho_u[fluid] += self.rho[fluid] * acceleration_vector[0] * step_dt
+            self.rho_v[fluid] += self.rho[fluid] * acceleration_vector[1] * step_dt
+            self.energy[fluid] += step_dt * (
+                mom_x[fluid] * acceleration_vector[0]
+                + mom_y[fluid] * acceleration_vector[1]
+            )
+            self._sync_primitive_from_conservative()
+            return
+
+        accel_step = acceleration_vector * step_dt
         self.u[fluid] += accel_step[0]
         self.v[fluid] += accel_step[1]
 
     def _enforce_domain_boundary(self):
         """Outer-domain boundary model (laminar freestream or fallback no-slip)."""
+        if self.compressible:
+            self._enforce_compressible_domain_boundary()
+            return
+
         if not self.assume_laminar_edges:
             self.u[0, :] = 0.0
             self.u[-1, :] = 0.0
@@ -540,6 +1151,10 @@ class FluidSimulation:
         Perform a single time step of the simulation.
         """
         self._update_reference_frame()
+        if self.compressible:
+            self._step_compressible()
+            return
+
         self._apply_body_force()
         self._enforce_domain_boundary()   # seed inlet before advect
         self._enforce_obstacle_boundary()
@@ -555,6 +1170,7 @@ class FluidSimulation:
         self._project()
         self._enforce_obstacle_boundary()
         self._enforce_domain_boundary()   # final clean-up
+        self.last_step_dt = self.time_step
         self.simulation_time += self.time_step
 
     def step_coupled(self, dynamics, dt=None):
@@ -566,7 +1182,7 @@ class FluidSimulation:
         3) integrate rocket state for the next step.
         """
         self.step()
-        coupling_dt = self.time_step if dt is None else float(dt)
+        coupling_dt = self.last_step_dt if dt is None else float(dt)
         return dynamics.integrate_step(self, coupling_dt, self.simulation_time)
 
     def _advect(self):
@@ -604,11 +1220,12 @@ class FluidSimulation:
         self.u = u_new
         self.v = v_new
 
-    def _diffuse(self):
+    def _diffuse(self, dt=None):
         """
         Diffuse the velocity field using the diffusion equation.
         """
-        alpha = self.viscosity * self.time_step
+        step_dt = self.time_step if dt is None else float(dt)
+        alpha = self.viscosity * step_dt
         for _ in range(20):  # Iterative solver
             self.u[1:-1, 1:-1] = (
                 self.u[1:-1, 1:-1]

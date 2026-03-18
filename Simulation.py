@@ -2,6 +2,8 @@ from Mechanisms.Classes import RocketProfile
 import numpy as np
 import matplotlib.pyplot as plt
 import time
+from pathlib import Path
+from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 from matplotlib.widgets import Slider
 from Mechanisms.FluidSimulation import FluidSimulation
 from Mechanisms.RocketDynamics import RocketDynamics
@@ -22,6 +24,12 @@ COMPRESSIBLE_BASE_MACH = 1.45
 COMPRESSIBLE_GUST_MACH = 0.025
 COMPRESSIBLE_CFL_NUMBER = 0.70
 COMPRESSIBLE_FLUX_SCHEME = "hllc"
+
+EXPORT_VIDEO = True
+SHOW_PLOT = True
+VIDEO_FPS = 20
+VIDEO_DPI = 140
+VIDEO_BASENAME = "rocket_compressible"
 
 # Artemis-II-inspired slender profile proportions for the 2D silhouette.
 artemis_diameter_m = 8.4
@@ -774,4 +782,39 @@ def on_slider_change(value):
 
 
 time_slider.on_changed(on_slider_change)
-plt.show()
+
+def save_simulation_video():
+    output_dir = Path("outputs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    animation = FuncAnimation(
+        fig,
+        lambda i: draw_frame(i) or [],
+        frames=num_frames,
+        interval=1000.0 / float(max(VIDEO_FPS, 1)),
+        blit=False,
+        repeat=False,
+    )
+
+    mp4_path = output_dir / f"{VIDEO_BASENAME}.mp4"
+    try:
+        writer = FFMpegWriter(
+            fps=VIDEO_FPS,
+            codec="libx264",
+            bitrate=5000,
+            extra_args=["-pix_fmt", "yuv420p"],
+        )
+        animation.save(str(mp4_path), writer=writer, dpi=VIDEO_DPI)
+        print(f"Saved video: {mp4_path}")
+    except Exception as exc:
+        gif_path = output_dir / f"{VIDEO_BASENAME}.gif"
+        print(f"FFmpeg export failed ({exc}). Falling back to GIF: {gif_path}")
+        gif_writer = PillowWriter(fps=VIDEO_FPS)
+        animation.save(str(gif_path), writer=gif_writer, dpi=VIDEO_DPI)
+
+
+if EXPORT_VIDEO:
+    save_simulation_video()
+
+if SHOW_PLOT:
+    plt.show()

@@ -1,4 +1,6 @@
 from Mechanisms.Classes import RocketProfile
+import os
+import shutil
 import numpy as np
 import matplotlib.pyplot as plt
 import time
@@ -13,7 +15,7 @@ from Mechanisms.Graphing import format_duration, update_progress_bar
 # - small physics dt keeps advection/projection stable
 # - larger frame interval keeps animation length manageable
 # - compressible mode may substep internally with a CFL-limited dt
-USE_COMPRESSIBLE = True
+USE_COMPRESSIBLE = False
 time_step = 0.02 if USE_COMPRESSIBLE else 0.1
 sim_time = 80.0 if USE_COMPRESSIBLE else 250.0
 frame_interval = 0.5 if USE_COMPRESSIBLE else 1.0
@@ -30,6 +32,10 @@ SHOW_PLOT = True
 VIDEO_FPS = 20
 VIDEO_DPI = 140
 VIDEO_BASENAME = "rocket_compressible"
+EXPORT_GIF_COPY = True
+VIDEO_CASE_TAG = "baseline"
+FIGURE_HEIGHT_SCALE = 1.20
+INLET_MACH = COMPRESSIBLE_BASE_MACH
 
 # Artemis-II-inspired slender profile proportions for the 2D silhouette.
 artemis_diameter_m = 8.4
@@ -372,7 +378,7 @@ if not np.isfinite(global_max_shear):
 
 max_dim = max(rows, cols)
 fig_width = 16.0 * cols / max_dim
-fig_height = 10.8 * rows / max_dim
+fig_height = 10.8 * rows / max_dim * FIGURE_HEIGHT_SCALE
 fig = plt.figure(figsize=(fig_width, fig_height))
 fig.patch.set_facecolor("white")
 gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.30,
@@ -783,6 +789,28 @@ def on_slider_change(value):
 
 time_slider.on_changed(on_slider_change)
 
+def _safe_tag(tag: str) -> str:
+    """Sanitize string for use in filename."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in tag)
+
+def _build_video_basename() -> str:
+    mach_tag = f"m{INLET_MACH:.2f}".replace(".", "p")
+    return f"{VIDEO_BASENAME}_{COMPRESSIBLE_FLUX_SCHEME}_{mach_tag}_{_safe_tag(VIDEO_CASE_TAG)}"
+
+def _resolve_ffmpeg_executable() -> str | None:
+    env_path = os.environ.get("FFMPEG_PATH")
+    candidates = [
+        env_path,
+        shutil.which("ffmpeg"),
+        shutil.which("ffmpeg.exe"),
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(candidate)
+    return None
+
 def save_simulation_video():
     output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -796,21 +824,34 @@ def save_simulation_video():
         repeat=False,
     )
 
-    mp4_path = output_dir / f"{VIDEO_BASENAME}.mp4"
-    try:
-        writer = FFMpegWriter(
-            fps=VIDEO_FPS,
-            codec="libx264",
-            bitrate=5000,
-            extra_args=["-pix_fmt", "yuv420p"],
-        )
-        animation.save(str(mp4_path), writer=writer, dpi=VIDEO_DPI)
-        print(f"Saved video: {mp4_path}")
-    except Exception as exc:
-        gif_path = output_dir / f"{VIDEO_BASENAME}.gif"
-        print(f"FFmpeg export failed ({exc}). Falling back to GIF: {gif_path}")
+    basename = _build_video_basename()
+    mp4_path = output_dir / f"{basename}.mp4"
+    gif_path = output_dir / f"{basename}.gif"
+
+    ffmpeg_path = _resolve_ffmpeg_executable()
+    saved_mp4 = False
+
+    if ffmpeg_path:
+        plt.rcParams["animation.ffmpeg_path"] = ffmpeg_path
+        try:
+            writer = FFMpegWriter(
+                fps=VIDEO_FPS,
+                codec="libx264",
+                bitrate=5000,
+                extra_args=["-pix_fmt", "yuv420p"],
+            )
+            animation.save(str(mp4_path), writer=writer, dpi=VIDEO_DPI)
+            print(f"Saved video: {mp4_path}")
+            saved_mp4 = True
+        except Exception as exc:
+            print(f"FFmpeg export failed ({exc}).")
+    else:
+        print("FFmpeg executable not found (set FFMPEG_PATH or install ffmpeg).")
+
+    if EXPORT_GIF_COPY or not saved_mp4:
         gif_writer = PillowWriter(fps=VIDEO_FPS)
         animation.save(str(gif_path), writer=gif_writer, dpi=VIDEO_DPI)
+        print(f"Saved GIF: {gif_path}")
 
 
 if EXPORT_VIDEO:

@@ -13,13 +13,15 @@ from Mechanisms.Graphing import format_duration, update_progress_bar
 # - compressible mode may substep internally with a CFL-limited dt
 USE_COMPRESSIBLE = True
 time_step = 0.02 if USE_COMPRESSIBLE else 0.1
-sim_time = 30.0 if USE_COMPRESSIBLE else 250.0
+sim_time = 80.0 if USE_COMPRESSIBLE else 250.0
 frame_interval = 0.5 if USE_COMPRESSIBLE else 1.0
 num_frames = int(sim_time / frame_interval)
 
 SIM_SPEED_SCALE = 1.0 if USE_COMPRESSIBLE else 1.0 / 80.0
-COMPRESSIBLE_BASE_MACH = 0.35
+COMPRESSIBLE_BASE_MACH = 1.45
 COMPRESSIBLE_GUST_MACH = 0.025
+COMPRESSIBLE_CFL_NUMBER = 0.70
+COMPRESSIBLE_FLUX_SCHEME = "hllc"
 
 # Artemis-II-inspired slender profile proportions for the 2D silhouette.
 artemis_diameter_m = 8.4
@@ -96,6 +98,8 @@ def compute_diagnostics(sim: FluidSimulation):
 
     # Pressure field (already computed during projection step)
     pressure = sim.p.copy()
+    if sim.compressible:
+        pressure = pressure - float(getattr(sim, "freestream_pressure", 0.0))
 
     # Streamwise velocity component projected onto current freestream direction.
     streamwise_velocity = (
@@ -103,7 +107,9 @@ def compute_diagnostics(sim: FluidSimulation):
         + sim.v * float(sim.freestream_direction[1])
     )
 
-    total_drag_n, pressure_drag_n, shear_drag_n, shear_stress = dynamics.compute_drag_components_n(
+    total_drag_signed_n, pressure_drag_signed_n, shear_drag_signed_n, shear_stress = dynamics.compute_drag_components_n(
+        sim)
+    total_drag_mag_n, pressure_drag_mag_n, shear_drag_mag_n, _ = dynamics.compute_drag_components_n_magnitude(
         sim)
 
     diagnostics = {
@@ -115,15 +121,18 @@ def compute_diagnostics(sim: FluidSimulation):
         "temperature": sim.temperature.copy() if sim.compressible else None,
         "mach": sim.mach.copy() if sim.compressible else None,
         "shear_stress": shear_stress,
-        "drag_total": total_drag_n,
-        "drag_pressure": pressure_drag_n,
-        "drag_shear": shear_drag_n,
+        "drag_total": total_drag_mag_n,
+        "drag_pressure": pressure_drag_mag_n,
+        "drag_shear": shear_drag_mag_n,
+        "drag_total_signed": total_drag_signed_n,
+        "drag_pressure_signed": pressure_drag_signed_n,
+        "drag_shear_signed": shear_drag_signed_n,
     }
     return diagnostics
 
 
 # Initialise the fluid simulation
-grid_size = (200, 650)  # Height x Width
+grid_size = (140, 460) if USE_COMPRESSIBLE else (200, 650)  # Height x Width
 viscosity = (
     SEA_LEVEL_ATMOSPHERE.dynamic_viscosity_pa_s /
     SEA_LEVEL_ATMOSPHERE.density_kg_m3
@@ -157,6 +166,9 @@ simulation = FluidSimulation(
     inflow_blend=0.02,
     compressible=USE_COMPRESSIBLE,
     reference_temperature=SEA_LEVEL_ATMOSPHERE.temperature_k,
+    cfl_number=COMPRESSIBLE_CFL_NUMBER,
+    compressible_flux_scheme=COMPRESSIBLE_FLUX_SCHEME,
+    compressible_velocity_diffusion=0.0,
 )
 
 if USE_COMPRESSIBLE:
@@ -269,6 +281,9 @@ for frame_index in range(num_frames):
         "drag_total": diagnostics["drag_total"],
         "drag_pressure": diagnostics["drag_pressure"],
         "drag_shear": diagnostics["drag_shear"],
+        "drag_total_signed": diagnostics["drag_total_signed"],
+        "drag_pressure_signed": diagnostics["drag_pressure_signed"],
+        "drag_shear_signed": diagnostics["drag_shear_signed"],
         "frame_thrust_n": frame_thrust_n,
         "frame_net_force_n": frame_net_force_n,
         "frame_rocket_speed_mps": frame_rocket_speed_mps,
@@ -320,8 +335,18 @@ for frame_index in range(num_frames):
         frame_data["shear_plot"] = shear_plot
 
     frames.append(frame_data)
-    drag_history.append((frame_time, diagnostics["drag_total"],
-                        diagnostics["drag_pressure"], diagnostics["drag_shear"], frame_thrust_n, frame_net_force_n, frame_altitude_m))
+    drag_history.append((
+        frame_time,
+        diagnostics["drag_total"],
+        diagnostics["drag_pressure"],
+        diagnostics["drag_shear"],
+        diagnostics["drag_total_signed"],
+        diagnostics["drag_pressure_signed"],
+        diagnostics["drag_shear_signed"],
+        frame_thrust_n,
+        frame_net_force_n,
+        frame_altitude_m,
+    ))
     update_progress_bar(frame_index + 1, num_frames, precompute_start_time)
 
 if not np.isfinite(global_min_speed) or not np.isfinite(global_max_speed):
@@ -374,6 +399,7 @@ def draw_frame(frame_index):
     drag_total = frame["drag_total"]
     drag_pressure = frame["drag_pressure"]
     drag_shear = frame["drag_shear"]
+    drag_total_signed = frame["drag_total_signed"]
     frame_thrust_n = frame["frame_thrust_n"]
     frame_net_force_n = frame["frame_net_force_n"]
     frame_rocket_speed_mps = frame["frame_rocket_speed_mps"]
@@ -408,12 +434,23 @@ def draw_frame(frame_index):
 
     # Top-middle: Pressure
     ax_pressure.set_facecolor("white")
+    pressure_vmin = global_min_pressure
+    pressure_vmax = global_max_pressure
+    pressure_title = "Pressure Field"
+    if simulation.compressible:
+        pressure_min = np.nanpercentile(pressure_plot, 1)
+        pressure_max = np.nanpercentile(pressure_plot, 99)
+        pressure_lim = max(abs(pressure_min), abs(pressure_max), 1.0)
+        pressure_vmin = -pressure_lim
+        pressure_vmax = pressure_lim
+        pressure_title = "Gauge Pressure Field"
+
     im_pressure = ax_pressure.imshow(
         pressure_plot,
         origin="lower",
         cmap="RdBu_r",
-        vmin=global_min_pressure,
-        vmax=global_max_pressure,
+        vmin=pressure_vmin,
+        vmax=pressure_vmax,
         extent=(0, cols - 1, 0, rows - 1),
         alpha=0.75,
         interpolation="bilinear",
@@ -422,7 +459,7 @@ def draw_frame(frame_index):
                      color="cornflowerblue", alpha=0.35, zorder=6)
     ax_pressure.plot(profile_x, profile_y, color="blue",
                      linewidth=1.5, zorder=7)
-    ax_pressure.set(aspect=1, title="Pressure Field")
+    ax_pressure.set(aspect=1, title=pressure_title)
     ax_pressure.set_xlabel("X", fontsize=9)
     ax_pressure.set_ylabel("Y", fontsize=9)
     ax_pressure.set_xlim(0, cols - 1)
@@ -439,14 +476,22 @@ def draw_frame(frame_index):
         density_plot = frame["density_plot"]
         temperature_plot = frame["temperature_plot"]
 
+        mach_vmin = np.nanpercentile(mach_plot, 1)
+        mach_vmax = np.nanpercentile(mach_plot, 99)
+        if not np.isfinite(mach_vmin) or not np.isfinite(mach_vmax) or mach_vmax <= mach_vmin:
+            mach_vmin = global_min_mach
+            mach_vmax = global_max_mach
+        if mach_vmax <= mach_vmin:
+            mach_vmax = mach_vmin + 1e-6
+
         # Top-right: Mach number
         ax_streamwise.set_facecolor("white")
         im_streamwise = ax_streamwise.imshow(
             mach_plot,
             origin="lower",
             cmap="plasma",
-            vmin=global_min_mach,
-            vmax=global_max_mach,
+            vmin=mach_vmin,
+            vmax=mach_vmax,
             extent=(0, cols - 1, 0, rows - 1),
             alpha=0.75,
             interpolation="bilinear",
@@ -469,12 +514,20 @@ def draw_frame(frame_index):
 
         # Bottom-left: Density
         ax_vortex.set_facecolor("white")
+        density_vmin = np.nanpercentile(density_plot, 1)
+        density_vmax = np.nanpercentile(density_plot, 99)
+        if not np.isfinite(density_vmin) or not np.isfinite(density_vmax) or density_vmax <= density_vmin:
+            density_vmin = global_min_density
+            density_vmax = global_max_density
+        if density_vmax <= density_vmin:
+            density_vmax = density_vmin + 1e-6
+
         im_vortex = ax_vortex.imshow(
             density_plot,
             origin="lower",
             cmap="cividis",
-            vmin=global_min_density,
-            vmax=global_max_density,
+            vmin=density_vmin,
+            vmax=density_vmax,
             extent=(0, cols - 1, 0, rows - 1),
             alpha=0.75,
             interpolation="bilinear",
@@ -563,15 +616,19 @@ def draw_frame(frame_index):
         [item[2] for item in drag_history[: frame_index + 1]], dtype=float)
     history_drag_shear = np.array(
         [item[3] for item in drag_history[: frame_index + 1]], dtype=float)
-    history_thrust = np.array(
+    history_drag_total_signed = np.array(
         [item[4] for item in drag_history[: frame_index + 1]], dtype=float)
+    history_thrust = np.array(
+        [item[7] for item in drag_history[: frame_index + 1]], dtype=float)
     history_net = np.array(
-        [item[5] for item in drag_history[: frame_index + 1]], dtype=float)
+        [item[8] for item in drag_history[: frame_index + 1]], dtype=float)
     history_altitude = np.array(
-        [item[6] for item in drag_history[: frame_index + 1]], dtype=float)
+        [item[9] for item in drag_history[: frame_index + 1]], dtype=float)
 
     ax_drag.plot(history_time, history_drag_total,
                  color="#1f77b4", linewidth=2.0, label="Total")
+    ax_drag.plot(history_time, history_drag_total_signed,
+                 color="#17becf", linewidth=1.1, linestyle="-.", label="Signed Total")
     ax_drag.plot(history_time, history_drag_pressure,
                  color="#d62728", linewidth=1.3, linestyle="--", label="Pressure")
     ax_drag.plot(history_time, history_drag_shear,
@@ -580,7 +637,7 @@ def draw_frame(frame_index):
                  linewidth=1.5, linestyle=":", label="Thrust")
     ax_drag.plot(history_time, history_net, color="#ff7f0e",
                  linewidth=1.5, linestyle="-.", label="Net (T-D-W)")
-    ax_drag.scatter([frame_time], [drag_total],
+    ax_drag.scatter([frame_time], [drag_total_signed],
                     color="black", s=34, zorder=3)
 
     ax_drag_altitude.plot(history_time, history_altitude, color="#111111",
@@ -595,7 +652,7 @@ def draw_frame(frame_index):
     else:
         ax_drag.set_xlim(0.0, 1.0)
 
-    combined_forces = np.concatenate((history_drag_total, history_drag_pressure, history_drag_shear,
+    combined_forces = np.concatenate((history_drag_total, history_drag_total_signed, history_drag_pressure, history_drag_shear,
                                      history_thrust, history_net)) if history_drag_total.size > 0 else np.array([0.0])
     y_min = float(np.min(combined_forces))
     y_max = float(np.max(combined_forces))
@@ -612,6 +669,17 @@ def draw_frame(frame_index):
 
     if simulation.compressible:
         temperature_plot = frame["temperature_plot"]
+        temperature_vmin = np.nanpercentile(temperature_plot, 1)
+        temperature_vmax = np.nanpercentile(temperature_plot, 99)
+        if (
+            not np.isfinite(temperature_vmin)
+            or not np.isfinite(temperature_vmax)
+            or temperature_vmax <= temperature_vmin
+        ):
+            temperature_vmin = global_min_temperature
+            temperature_vmax = global_max_temperature
+        if temperature_vmax <= temperature_vmin:
+            temperature_vmax = temperature_vmin + 1e-6
 
         # Bottom-right: Temperature
         ax_shear.set_facecolor("white")
@@ -619,8 +687,8 @@ def draw_frame(frame_index):
             temperature_plot,
             origin="lower",
             cmap="inferno",
-            vmin=global_min_temperature,
-            vmax=global_max_temperature,
+            vmin=temperature_vmin,
+            vmax=temperature_vmax,
             extent=(0, cols - 1, 0, rows - 1),
             alpha=0.75,
             interpolation="bilinear",

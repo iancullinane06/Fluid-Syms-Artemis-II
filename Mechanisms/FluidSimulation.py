@@ -36,6 +36,8 @@ class FluidSimulation:
         cfl_number=0.45,
         density_floor=1e-4,
         pressure_floor=1.0,
+        compressible_velocity_diffusion=0.0,
+        compressible_flux_scheme="hllc",
     ):
         """
         Initialize the fluid simulation.
@@ -77,6 +79,13 @@ class FluidSimulation:
         self.cfl_number = float(np.clip(cfl_number, 0.05, 0.95))
         self.density_floor = float(max(density_floor, 1e-8))
         self.pressure_floor = float(max(pressure_floor, 1e-8))
+        self.compressible_velocity_diffusion = float(
+            max(compressible_velocity_diffusion, 0.0))
+        flux_name = str(compressible_flux_scheme).strip().lower()
+        if flux_name not in {"hllc", "rusanov"}:
+            raise ValueError(
+                "compressible_flux_scheme must be 'hllc' or 'rusanov'")
+        self.compressible_flux_scheme = flux_name
         self.base_ambient_velocity = self.edge_speed * self.freestream_direction
         self.relative_velocity_target = self.base_ambient_velocity.copy()
         self.reference_acceleration_vector = np.zeros(2, dtype=float)
@@ -399,18 +408,153 @@ class FluidSimulation:
                            velocity_right + sound_right)
         return 0.5 * (left_flux + right_flux) - 0.5 * s_max[None, ...] * (right_state - left_state)
 
+    def _hllc_flux(self, left_state, right_state, axis):
+        """HLLC approximate Riemann flux for 2D Euler states across one axis-aligned face."""
+        flux_left = self._euler_flux(left_state, axis)
+        flux_right = self._euler_flux(right_state, axis)
+
+        rho_left = np.maximum(left_state[0], self.density_floor)
+        rho_right = np.maximum(right_state[0], self.density_floor)
+        pressure_left = self._pressure_from_state(left_state)
+        pressure_right = self._pressure_from_state(right_state)
+        sound_left = self._sound_speed_from_state(left_state)
+        sound_right = self._sound_speed_from_state(right_state)
+
+        if axis == 0:
+            normal_momentum_left = left_state[1]
+            normal_momentum_right = right_state[1]
+            tangential_momentum_left = left_state[2]
+            tangential_momentum_right = right_state[2]
+        else:
+            normal_momentum_left = left_state[2]
+            normal_momentum_right = right_state[2]
+            tangential_momentum_left = left_state[1]
+            tangential_momentum_right = right_state[1]
+
+        normal_velocity_left = normal_momentum_left / rho_left
+        normal_velocity_right = normal_momentum_right / rho_right
+        tangential_velocity_left = tangential_momentum_left / rho_left
+        tangential_velocity_right = tangential_momentum_right / rho_right
+
+        wave_speed_left = np.minimum(
+            normal_velocity_left - sound_left,
+            normal_velocity_right - sound_right,
+        )
+        wave_speed_right = np.maximum(
+            normal_velocity_left + sound_left,
+            normal_velocity_right + sound_right,
+        )
+
+        denominator = (
+            rho_left * (wave_speed_left - normal_velocity_left)
+            - rho_right * (wave_speed_right - normal_velocity_right)
+        )
+        denominator = np.where(np.abs(denominator) < 1e-8, 1e-8, denominator)
+        contact_speed = (
+            pressure_right
+            - pressure_left
+            + rho_left * normal_velocity_left * (wave_speed_left - normal_velocity_left)
+            - rho_right * normal_velocity_right * (wave_speed_right - normal_velocity_right)
+        ) / denominator
+
+        pressure_star_left = pressure_left + rho_left * \
+            (wave_speed_left - normal_velocity_left) * \
+            (contact_speed - normal_velocity_left)
+        pressure_star_right = pressure_right + rho_right * \
+            (wave_speed_right - normal_velocity_right) * \
+            (contact_speed - normal_velocity_right)
+        pressure_star = np.maximum(
+            0.5 * (pressure_star_left + pressure_star_right),
+            self.pressure_floor,
+        )
+
+        denom_left_star = wave_speed_left - contact_speed
+        denom_right_star = wave_speed_right - contact_speed
+        denom_left_star = np.where(np.abs(denom_left_star) < 1e-8, 1e-8, denom_left_star)
+        denom_right_star = np.where(np.abs(denom_right_star) < 1e-8, 1e-8, denom_right_star)
+
+        rho_star_left = rho_left * \
+            (wave_speed_left - normal_velocity_left) / denom_left_star
+        rho_star_right = rho_right * \
+            (wave_speed_right - normal_velocity_right) / denom_right_star
+
+        energy_left = left_state[3]
+        energy_right = right_state[3]
+        energy_star_left = (
+            (wave_speed_left - normal_velocity_left) * energy_left
+            - pressure_left * normal_velocity_left
+            + pressure_star * contact_speed
+        ) / denom_left_star
+        energy_star_right = (
+            (wave_speed_right - normal_velocity_right) * energy_right
+            - pressure_right * normal_velocity_right
+            + pressure_star * contact_speed
+        ) / denom_right_star
+
+        normal_momentum_star_left = rho_star_left * contact_speed
+        normal_momentum_star_right = rho_star_right * contact_speed
+        tangential_momentum_star_left = rho_star_left * tangential_velocity_left
+        tangential_momentum_star_right = rho_star_right * tangential_velocity_right
+
+        star_left = np.zeros_like(left_state)
+        star_right = np.zeros_like(right_state)
+        star_left[0] = rho_star_left
+        star_right[0] = rho_star_right
+
+        if axis == 0:
+            star_left[1] = normal_momentum_star_left
+            star_left[2] = tangential_momentum_star_left
+            star_right[1] = normal_momentum_star_right
+            star_right[2] = tangential_momentum_star_right
+        else:
+            star_left[1] = tangential_momentum_star_left
+            star_left[2] = normal_momentum_star_left
+            star_right[1] = tangential_momentum_star_right
+            star_right[2] = normal_momentum_star_right
+
+        star_left[3] = energy_star_left
+        star_right[3] = energy_star_right
+
+        flux = flux_right.copy()
+        mask_left = wave_speed_left >= 0.0
+        mask_left_star = (wave_speed_left < 0.0) & (contact_speed >= 0.0)
+        mask_right_star = (contact_speed < 0.0) & (wave_speed_right >= 0.0)
+
+        if np.any(mask_left):
+            flux[:, mask_left] = flux_left[:, mask_left]
+        if np.any(mask_left_star):
+            flux[:, mask_left_star] = (
+                flux_left[:, mask_left_star]
+                + wave_speed_left[mask_left_star][None, :]
+                * (star_left[:, mask_left_star] - left_state[:, mask_left_star])
+            )
+        if np.any(mask_right_star):
+            flux[:, mask_right_star] = (
+                flux_right[:, mask_right_star]
+                + wave_speed_right[mask_right_star][None, :]
+                * (star_right[:, mask_right_star] - right_state[:, mask_right_star])
+            )
+
+        return flux
+
+    def _interface_flux(self, left_state, right_state, axis):
+        """Dispatch interface flux computation for compressible Euler updates."""
+        if self.compressible_flux_scheme == "hllc":
+            return self._hllc_flux(left_state, right_state, axis)
+        return self._rusanov_flux(left_state, right_state, axis)
+
     def _advance_compressible_euler(self, dt):
         """Advance one first-order finite-volume Euler step using dimensional splitting."""
         state = self._conservative_state()
         updated = state.copy()
 
         if self.grid_size[1] > 2:
-            flux_x = self._rusanov_flux(state[:, :, :-1], state[:, :, 1:], axis=0)
+            flux_x = self._interface_flux(state[:, :, :-1], state[:, :, 1:], axis=0)
             updated[:, :, 1:-1] -= dt * (flux_x[:, :, 1:] - flux_x[:, :, :-1])
 
         state_y = updated.copy()
         if self.grid_size[0] > 2:
-            flux_y = self._rusanov_flux(state_y[:, :-1, :], state_y[:, 1:, :], axis=1)
+            flux_y = self._interface_flux(state_y[:, :-1, :], state_y[:, 1:, :], axis=1)
             state_y[:, 1:-1, :] -= dt * (flux_y[:, 1:, :] - flux_y[:, :-1, :])
 
         if np.any(self.obstacle_mask):
@@ -580,9 +724,18 @@ class FluidSimulation:
         self._enforce_domain_boundary()
         self._enforce_obstacle_boundary()
         self._advance_compressible_euler(local_dt)
-        if self.viscosity > 0.0:
+
+        # Optional extra smoothing for difficult setups.
+        # Default is OFF because first-order Rusanov already introduces strong
+        # numerical diffusion; adding implicit velocity diffusion here can wipe
+        # out wake structures and smear shock features.
+        if self.compressible_velocity_diffusion > 0.0:
+            original_viscosity = self.viscosity
+            self.viscosity = self.compressible_velocity_diffusion
             self._diffuse(dt=local_dt)
+            self.viscosity = original_viscosity
             self._sync_conservative_from_primitive()
+
         self._enforce_obstacle_boundary()
         self._enforce_domain_boundary()
         self.last_step_dt = local_dt

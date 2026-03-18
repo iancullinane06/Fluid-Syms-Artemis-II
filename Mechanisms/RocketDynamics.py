@@ -138,6 +138,10 @@ class RocketDynamics:
     @staticmethod
     def compute_surface_force_components(sim: FluidSimulation) -> tuple[float, float, float, np.ndarray]:
         pressure = sim.p
+        pressure_reference = 0.0
+        if getattr(sim, "compressible", False):
+            pressure_reference = float(
+                max(getattr(sim, "freestream_pressure", 0.0), 0.0))
         dynamic_viscosity = max(sim.viscosity * sim.density, 1e-8)
 
         dudx = np.zeros_like(sim.u)
@@ -183,7 +187,7 @@ class RocketDynamics:
                 nx = nx[valid] / normal_mag[valid]
                 ny = ny[valid] / normal_mag[valid]
 
-                p_local = pressure[surface_band][valid]
+                p_local = pressure[surface_band][valid] - pressure_reference
                 pressure_force_x = -p_local * nx
                 pressure_force_y = -p_local * ny
 
@@ -219,9 +223,21 @@ class RocketDynamics:
         density_scale = float(max(sim.density, 1e-9) /
                               max(self.reference_density_kg_m3, 1e-9))
         total_drag_n = total_drag_solver * self.drag_force_scale_n * density_scale
-        pressure_drag_n = pressure_drag_solver * self.drag_force_scale_n * density_scale
+        pressure_drag_n = pressure_drag_solver * \
+            self.drag_force_scale_n * density_scale
         shear_drag_n = shear_drag_solver * self.drag_force_scale_n * density_scale
         return total_drag_n, pressure_drag_n, shear_drag_n, shear_stress
+
+    def compute_drag_components_n_magnitude(self, sim: FluidSimulation) -> tuple[float, float, float, np.ndarray]:
+        """Return non-negative drag magnitudes for robust flight-state integration."""
+        total_drag_n, pressure_drag_n, shear_drag_n, shear_stress = self.compute_drag_components_n(
+            sim)
+        return (
+            max(float(total_drag_n), 0.0),
+            max(float(pressure_drag_n), 0.0),
+            max(float(shear_drag_n), 0.0),
+            shear_stress,
+        )
 
     def integrate_step(self, sim: FluidSimulation, dt: float, time_s: float) -> RocketState:
         atmosphere = self.atmosphere_at_altitude(self.state.altitude_m)
@@ -237,8 +253,7 @@ class RocketDynamics:
                 pressure_pa=atmosphere.pressure_pa,
             )
 
-        total_drag_n, _, _, _ = self.compute_drag_components_n(sim)
-        drag_n = max(float(total_drag_n), 0.0)
+        drag_n, _, _, _ = self.compute_drag_components_n_magnitude(sim)
         thrust_n = float(self.thrust_profile(float(time_s)))
 
         dt = float(max(dt, 0.0))

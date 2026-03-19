@@ -256,7 +256,7 @@ def draw_frame(frame_index: int):
                         extent=EXTENT, origin="lower")
         ax_mach.text(2, ROWS - 6, "white line = M=1 sonic line",
                      color="white", fontsize=6, va="top")
-    except Exception:
+    except (ValueError, RuntimeError):
         pass
 
     # ── Gauge pressure ───────────────────────────────
@@ -309,8 +309,8 @@ def draw_frame(frame_index: int):
     ax_blank.text(0.05, 0.95, info_text,
                   transform=ax_blank.transAxes,
                   fontsize=9, va="top", fontfamily="monospace",
-                  bbox=dict(boxstyle="round", facecolor="lightyellow",
-                            edgecolor="gray", alpha=0.8))
+                bbox={"boxstyle": "round", "facecolor": "lightyellow",
+                    "edgecolor": "gray", "alpha": 0.8})
     ax_blank.set_title("Run Parameters", fontsize=10)
 
     fig.suptitle(
@@ -360,7 +360,7 @@ def save_simulation_video():
                               extra_args=["-pix_fmt", "yuv420p"])
         anim.save(str(mp4_path), writer=writer, dpi=VIDEO_DPI)
         print(f"Saved: {mp4_path}")
-    except Exception as exc:
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         gif_path = output_dir / f"{VIDEO_BASENAME}.gif"
         print(f"FFmpeg failed ({exc}), falling back to GIF: {gif_path}")
         anim.save(str(gif_path), writer=PillowWriter(fps=VIDEO_FPS), dpi=VIDEO_DPI)

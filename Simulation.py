@@ -806,7 +806,7 @@ def save_simulation_video():
         )
         animation.save(str(mp4_path), writer=writer, dpi=VIDEO_DPI)
         print(f"Saved video: {mp4_path}")
-    except Exception as exc:
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         gif_path = output_dir / f"{VIDEO_BASENAME}.gif"
         print(f"FFmpeg export failed ({exc}). Falling back to GIF: {gif_path}")
         gif_writer = PillowWriter(fps=VIDEO_FPS)

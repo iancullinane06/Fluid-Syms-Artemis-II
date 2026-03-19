@@ -86,7 +86,7 @@ def rocket_velocity_profile(time_s: float) -> np.ndarray:
     return dynamics.rocket_velocity_profile(time_s)
 
 
-def compute_diagnostics(sim: FluidSimulation):
+def compute_diagnostics(sim: FluidSimulation) -> dict:
     speed = np.hypot(sim.u, sim.v)
 
     # Vorticity: dvdx - dudy
@@ -484,7 +484,7 @@ def draw_frame(frame_index):
         if mach_vmax <= mach_vmin:
             mach_vmax = mach_vmin + 1e-6
 
-        # Top-right: Mach number
+        # Top-right: Local Mach number
         ax_streamwise.set_facecolor("white")
         im_streamwise = ax_streamwise.imshow(
             mach_plot,
@@ -500,7 +500,7 @@ def draw_frame(frame_index):
                            color="cornflowerblue", alpha=0.35, zorder=6)
         ax_streamwise.plot(profile_x, profile_y, color="blue",
                            linewidth=1.5, zorder=7)
-        ax_streamwise.set(aspect=1, title="Mach Number")
+        ax_streamwise.set(aspect=1, title="Local Mach Number")
         ax_streamwise.set_xlabel("X", fontsize=9)
         ax_streamwise.set_ylabel("Y", fontsize=9)
         ax_streamwise.set_xlim(0, cols - 1)
@@ -607,7 +607,7 @@ def draw_frame(frame_index):
         else:
             colorbars["vortex"].update_normal(im_vortex)
 
-    # Bottom-middle: Drag/thrust/net force vs time, with altitude displacement.
+    # Bottom-middle: Drag/thrust/net force vs time, with altitude.
     history_time = np.array(
         [item[0] for item in drag_history[: frame_index + 1]], dtype=float)
     history_drag_total = np.array(
@@ -642,7 +642,7 @@ def draw_frame(frame_index):
 
     ax_drag_altitude.plot(history_time, history_altitude, color="#111111",
                           linewidth=1.4, linestyle="-", label="Altitude")
-    ax_drag_altitude.set_ylabel("Vertical Displacement (m)", fontsize=9)
+    ax_drag_altitude.set_ylabel("Altitude (m)", fontsize=9)
 
     if history_time.size > 0:
         x_min = float(np.min(history_time))
@@ -661,7 +661,7 @@ def draw_frame(frame_index):
     ax_drag.set_ylabel("Force (N)", fontsize=9)
     ax_drag.set_xlabel("Time (s)", fontsize=9)
     ax_drag.grid(True, alpha=0.3)
-    ax_drag.set_title("Forces & Vertical Displacement vs Time", fontsize=10)
+    ax_drag.set_title("Forces & Altitude vs Time", fontsize=10)
     force_handles, force_labels = ax_drag.get_legend_handles_labels()
     altitude_handles, altitude_labels = ax_drag_altitude.get_legend_handles_labels()
     ax_drag.legend(force_handles + altitude_handles,

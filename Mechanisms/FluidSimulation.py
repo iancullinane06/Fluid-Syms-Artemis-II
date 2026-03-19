@@ -38,6 +38,8 @@ class FluidSimulation:
         pressure_floor=1.0,
         compressible_velocity_diffusion=0.0,
         compressible_flux_scheme="hllc",
+        outflow_sponge_strength=0.06,
+        outflow_sponge_start=0.88,
     ):
         """
         Initialize the fluid simulation.
@@ -81,6 +83,8 @@ class FluidSimulation:
         self.pressure_floor = float(max(pressure_floor, 1e-8))
         self.compressible_velocity_diffusion = float(
             max(compressible_velocity_diffusion, 0.0))
+        self.outflow_sponge_strength = float(max(outflow_sponge_strength, 0.0))
+        self.outflow_sponge_start = float(np.clip(outflow_sponge_start, 0.5, 0.98))
         flux_name = str(compressible_flux_scheme).strip().lower()
         if flux_name not in {"hllc", "rusanov"}:
             raise ValueError(
@@ -235,7 +239,7 @@ class FluidSimulation:
         speed = float(np.linalg.norm(relative_velocity))
         self.relative_velocity_target = relative_velocity.copy()
 
-        dt = max(float(self.time_step), 1e-8)
+        dt = max(float(self.last_step_dt), 1e-8)
         self.reference_acceleration_vector = (
             self.relative_velocity_target - previous_relative_velocity) / dt
 
@@ -254,6 +258,11 @@ class FluidSimulation:
             self.density = float(max(np.mean(self.rho[fluid]), self.density_floor))
         else:
             self.density = float(max(np.mean(self.rho), self.density_floor))
+
+    def _safe_denom(self, value, eps=1e-8):
+        """Keep denominator away from zero while preserving sign."""
+        sign = np.where(value >= 0.0, 1.0, -1.0)
+        return np.where(np.abs(value) < eps, sign * eps, value)
 
     def _sync_conservative_from_primitive(self):
         """Rebuild conservative variables from primitive fields."""
@@ -449,7 +458,7 @@ class FluidSimulation:
             rho_left * (wave_speed_left - normal_velocity_left)
             - rho_right * (wave_speed_right - normal_velocity_right)
         )
-        denominator = np.where(np.abs(denominator) < 1e-8, 1e-8, denominator)
+        denominator = self._safe_denom(denominator)
         contact_speed = (
             pressure_right
             - pressure_left
@@ -470,13 +479,15 @@ class FluidSimulation:
 
         denom_left_star = wave_speed_left - contact_speed
         denom_right_star = wave_speed_right - contact_speed
-        denom_left_star = np.where(np.abs(denom_left_star) < 1e-8, 1e-8, denom_left_star)
-        denom_right_star = np.where(np.abs(denom_right_star) < 1e-8, 1e-8, denom_right_star)
+        denom_left_star = self._safe_denom(denom_left_star)
+        denom_right_star = self._safe_denom(denom_right_star)
 
         rho_star_left = rho_left * \
             (wave_speed_left - normal_velocity_left) / denom_left_star
         rho_star_right = rho_right * \
             (wave_speed_right - normal_velocity_right) / denom_right_star
+        rho_star_left = np.maximum(rho_star_left, self.density_floor)
+        rho_star_right = np.maximum(rho_star_right, self.density_floor)
 
         energy_left = left_state[3]
         energy_right = right_state[3]
@@ -571,6 +582,19 @@ class FluidSimulation:
         self.rho_u = state_y[1]
         self.rho_v = state_y[2]
         self.energy = state_y[3]
+
+        self.rho = np.where(np.isfinite(self.rho), self.rho, self.freestream_density)
+        self.rho = np.maximum(self.rho, self.density_floor)
+        self.rho_u = np.where(np.isfinite(self.rho_u), self.rho_u, 0.0)
+        self.rho_v = np.where(np.isfinite(self.rho_v), self.rho_v, 0.0)
+        self.energy = np.where(
+            np.isfinite(self.energy),
+            self.energy,
+            self.freestream_pressure / (self.gamma - 1.0),
+        )
+        kinetic = 0.5 * (self.rho_u**2 + self.rho_v**2) / np.maximum(self.rho, self.density_floor)
+        self.energy = np.maximum(self.energy, kinetic + self.pressure_floor / (self.gamma - 1.0))
+
         self._sync_primitive_from_conservative()
 
     def _enforce_compressible_domain_boundary(self):
@@ -717,6 +741,55 @@ class FluidSimulation:
         self.rho_v[obstacle] = 0.0
         self.energy[obstacle] = self.p[obstacle] / (self.gamma - 1.0)
 
+    def _apply_outflow_sponge(self, dt):
+        """Relax downstream band toward freestream to suppress outlet reflections."""
+        if self.outflow_sponge_strength <= 0.0:
+            return
+
+        rows, cols = self.grid_size
+        fluid = ~self.obstacle_mask
+        if not np.any(fluid):
+            return
+
+        beta_max = np.clip(self.outflow_sponge_strength * dt, 0.0, 0.25)
+        if beta_max <= 0.0:
+            return
+
+        target_u = self.edge_speed * self.freestream_direction[0]
+        target_v = self.edge_speed * self.freestream_direction[1]
+
+        if abs(self.freestream_direction[0]) >= abs(self.freestream_direction[1]):
+            n0 = int(self.outflow_sponge_start * cols)
+            n0 = int(np.clip(n0, 1, cols - 2))
+            ramp = np.linspace(0.0, 1.0, cols - n0)[None, :]
+            beta = beta_max * (ramp**2)
+            if self.freestream_direction[0] >= 0.0:
+                sl = (slice(None), slice(n0, cols))
+            else:
+                sl = (slice(None), slice(0, cols - n0))
+                beta = beta[:, ::-1]
+        else:
+            n0 = int(self.outflow_sponge_start * rows)
+            n0 = int(np.clip(n0, 1, rows - 2))
+            ramp = np.linspace(0.0, 1.0, rows - n0)[:, None]
+            beta = beta_max * (ramp**2)
+            if self.freestream_direction[1] >= 0.0:
+                sl = (slice(n0, rows), slice(None))
+            else:
+                sl = (slice(0, rows - n0), slice(None))
+                beta = beta[::-1, :]
+
+        local_fluid = fluid[sl]
+        if not np.any(local_fluid):
+            return
+
+        self.rho[sl] = np.where(local_fluid, (1.0 - beta) * self.rho[sl] + beta * self.freestream_density, self.rho[sl])
+        self.p[sl] = np.where(local_fluid, (1.0 - beta) * self.p[sl] + beta * self.freestream_pressure, self.p[sl])
+        self.u[sl] = np.where(local_fluid, (1.0 - beta) * self.u[sl] + beta * target_u, self.u[sl])
+        self.v[sl] = np.where(local_fluid, (1.0 - beta) * self.v[sl] + beta * target_v, self.v[sl])
+        self.temperature = np.maximum(self.p / (self.rho * self.gas_constant), 1.0)
+        self._sync_conservative_from_primitive()
+
     def _step_compressible(self):
         """Advance the compressible branch using a simple first-order finite-volume update."""
         local_dt = self._compute_stable_time_step()
@@ -724,6 +797,7 @@ class FluidSimulation:
         self._enforce_domain_boundary()
         self._enforce_obstacle_boundary()
         self._advance_compressible_euler(local_dt)
+        self._apply_outflow_sponge(local_dt)
 
         # Optional extra smoothing for difficult setups.
         # Default is OFF because first-order Rusanov already introduces strong

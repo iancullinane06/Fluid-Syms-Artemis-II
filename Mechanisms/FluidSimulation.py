@@ -86,6 +86,10 @@ class FluidSimulation:
             raise ValueError(
                 "compressible_flux_scheme must be 'hllc' or 'rusanov'")
         self.compressible_flux_scheme = flux_name
+        self.nozzle_pressure_bc_enabled = False
+        self.nozzle_inlet_total_pressure = None
+        self.nozzle_inlet_total_temperature = None
+        self.nozzle_outlet_static_pressure = None
         self.base_ambient_velocity = self.edge_speed * self.freestream_direction
         self.relative_velocity_target = self.base_ambient_velocity.copy()
         self.reference_acceleration_vector = np.zeros(2, dtype=float)
@@ -197,6 +201,100 @@ class FluidSimulation:
         sound_speed = np.sqrt(
             self.gamma * self.freestream_pressure / self.freestream_density)
         self.set_uniform_flow(float(max(mach_number, 0.0)) * sound_speed, direction)
+
+    def set_nozzle_pressure_boundary(
+        self,
+        enabled=False,
+        inlet_total_pressure=None,
+        inlet_total_temperature=None,
+        outlet_static_pressure=None,
+    ):
+        """Enable pressure-driven x-direction nozzle boundary conditions for compressible runs."""
+        self.nozzle_pressure_bc_enabled = bool(enabled)
+        self.nozzle_inlet_total_pressure = (
+            None
+            if inlet_total_pressure is None
+            else float(max(inlet_total_pressure, self.pressure_floor))
+        )
+        self.nozzle_inlet_total_temperature = (
+            None
+            if inlet_total_temperature is None
+            else float(max(inlet_total_temperature, 1.0))
+        )
+        self.nozzle_outlet_static_pressure = (
+            None
+            if outlet_static_pressure is None
+            else float(max(outlet_static_pressure, self.pressure_floor))
+        )
+
+    def _enforce_nozzle_pressure_boundary(self):
+        """Pressure-driven left-inlet / right-outlet boundary condition for nozzle-style domains."""
+        rows, cols = self.grid_size
+        if cols < 3:
+            return
+
+        beta = self.edge_relaxation
+        gamma = self.gamma
+        gas_constant = self.gas_constant
+        inlet_total_pressure = (
+            self.freestream_pressure
+            if self.nozzle_inlet_total_pressure is None
+            else self.nozzle_inlet_total_pressure
+        )
+        inlet_total_temperature = (
+            self.freestream_temperature
+            if self.nozzle_inlet_total_temperature is None
+            else self.nozzle_inlet_total_temperature
+        )
+        outlet_static_pressure = (
+            self.freestream_pressure
+            if self.nozzle_outlet_static_pressure is None
+            else self.nozzle_outlet_static_pressure
+        )
+
+        inlet_u = np.maximum(self.u[:, 1], 1e-8)
+        inlet_v = self.v[:, 1]
+        inlet_speed = np.hypot(inlet_u, inlet_v)
+        inlet_sound = np.sqrt(np.maximum(gamma * self.p[:, 1] / np.maximum(self.rho[:, 1], self.density_floor), 1e-12))
+        inlet_mach = np.clip(inlet_speed / np.maximum(inlet_sound, 1e-8), 0.0, 2.0)
+
+        temperature_static = inlet_total_temperature / np.maximum(
+            1.0 + 0.5 * (gamma - 1.0) * inlet_mach**2,
+            1e-8,
+        )
+        pressure_static = inlet_total_pressure / np.maximum(
+            (1.0 + 0.5 * (gamma - 1.0) * inlet_mach**2) ** (gamma / (gamma - 1.0)),
+            1e-8,
+        )
+        density_static = np.maximum(
+            pressure_static / np.maximum(gas_constant * temperature_static, 1e-8),
+            self.density_floor,
+        )
+
+        self.rho[:, 0] = beta * density_static + (1.0 - beta) * self.rho[:, 1]
+        self.p[:, 0] = beta * pressure_static + (1.0 - beta) * self.p[:, 1]
+        self.u[:, 0] = np.maximum(beta * inlet_u + (1.0 - beta) * self.u[:, 1], 0.0)
+        self.v[:, 0] = beta * inlet_v + (1.0 - beta) * self.v[:, 1]
+
+        self.p[:, -1] = beta * outlet_static_pressure + (1.0 - beta) * self.p[:, -2]
+        self.rho[:, -1] = self.rho[:, -2]
+        self.u[:, -1] = self.u[:, -2]
+        self.v[:, -1] = self.v[:, -2]
+
+        self.rho[0, :] = self.rho[1, :]
+        self.rho[-1, :] = self.rho[-2, :]
+        self.p[0, :] = self.p[1, :]
+        self.p[-1, :] = self.p[-2, :]
+        self.u[0, :] = self.u[1, :]
+        self.u[-1, :] = self.u[-2, :]
+        self.v[0, :] = 0.0
+        self.v[-1, :] = 0.0
+
+        self.temperature = np.maximum(
+            self.p / (self.rho * self.gas_constant),
+            1.0,
+        )
+        self._sync_conservative_from_primitive()
 
     def get_conservative_fields(self):
         """Return copies of the conservative variables for inspection or debugging."""
@@ -597,6 +695,14 @@ class FluidSimulation:
                 1.0,
             )
             self._sync_conservative_from_primitive()
+            return
+
+        if (
+            self.nozzle_pressure_bc_enabled
+            and abs(self.freestream_direction[0]) >= abs(self.freestream_direction[1])
+            and self.freestream_direction[0] >= 0.0
+        ):
+            self._enforce_nozzle_pressure_boundary()
             return
 
         target_u = self.edge_speed * self.freestream_direction[0]

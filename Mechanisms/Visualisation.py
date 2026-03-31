@@ -123,7 +123,7 @@ def build_and_render_visualisations(
     fig_width = 16.0 * cols / max_dim
 
     fig_height = 12.0 * rows / max_dim * figure_height_scale
-    
+
     fig = plt.figure(figsize=(fig_width, fig_height))
     fig.patch.set_facecolor("white")
     gs = fig.add_gridspec(

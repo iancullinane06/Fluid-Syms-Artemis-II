@@ -1,172 +1,146 @@
 # Fluid-Syms-Artemis-II
 
-2D rocket-frame CFD-style prototype for visualising flow, wake formation, and drag trends around a rocket obstacle.
+2D rocket-frame CFD-style prototype for visualising flow, wake formation, drag trends, and (in compressible mode) Mach/thermodynamic structure around obstacles.
 
-## What this sim does
+## What this project currently includes
 
-The solver evolves a 2D velocity field around a rasterised rocket profile using a simplified incompressible Navier–Stokes pipeline:
+This repository now contains three related simulations:
 
-1. Update rocket-frame freestream from ambient and rocket velocity profiles
-2. Advect velocity (semi-Lagrangian, SciPy interpolation)
-3. Diffuse velocity (iterative viscous solve)
-4. Apply turbulence closure (Smagorinsky + vorticity confinement)
-5. Project to incompressible flow (Poisson pressure solve)
-6. Enforce obstacle no-slip + inlet/outlet boundaries
+1. **Rocket flow demo (default: compressible)** in [Simulation.py](Simulation.py)
+2. **Nozzle flow demo (compressible)** in [NozzleSim.py](NozzleSim.py)
+3. **1D ascent/drag model** in [Drag.py](Drag.py)
 
-Main files:
+The core solver lives in [Mechanisms/FluidSimulation.py](Mechanisms/FluidSimulation.py) and supports both:
 
-- [FluidSimulation.py](FluidSimulation.py): solver core
-- [Simulation.py](Simulation.py): demo setup, Artemis-like ascent profile, visualisation
-- [Classes.py](Classes.py): rocket geometry/profile dataclasses
-- [Functions.py](Functions.py): Reynolds number and drag-coefficient helpers
-- [Drag.py](Drag.py): separate 1D ascent/drag model (not tightly coupled to 2D solver)
+- **Incompressible branch** (semi-Lagrangian Navier–Stokes style projection method)
+- **Compressible branch** (finite-volume Euler update with Riemann fluxes: HLLC or Rusanov)
 
-## Core math (matching the code)
+## Main files
 
-### 1) Rocket-frame relative freestream
+- [Simulation.py](Simulation.py): Artemis-inspired rocket scenario, coupled to rocket dynamics and visualisation
+- [NozzleSim.py](NozzleSim.py): converging-diverging nozzle demo with Mach/pressure/temperature/density panels
+- [Drag.py](Drag.py): standalone ascent + drag analysis against atmosphere models
+- [Mechanisms/FluidSimulation.py](Mechanisms/FluidSimulation.py): CFD core (incompressible + compressible stepping)
+- [Mechanisms/RocketDynamics.py](Mechanisms/RocketDynamics.py): rocket state integration and drag decomposition
+- [Mechanisms/Visualisation.py](Mechanisms/Visualisation.py): frame rendering + MP4/GIF export helpers
+- [Mechanisms/Classes.py](Mechanisms/Classes.py): dataclasses and geometry helpers
+- [Mechanisms/Functions.py](Mechanisms/Functions.py): Reynolds number and drag-coefficient utility functions
 
-The boundary freestream is updated from:
+## Solver overview
+
+### Rocket-frame relative freestream
+
+Both modes update boundary freestream from ambient and rocket motion:
 
 $$
-\mathbf{u}_{\infty}(t) = \mathbf{u}_{\text{ambient}}(t) - \mathbf{u}_{\text{rocket}}(t)
+\mathbf{u}_{\infty}(t)=\mathbf{u}_{\text{ambient}}(t)-\mathbf{u}_{\text{rocket}}(t)
 $$
 
-with speed and direction:
+with
 
 $$
-U_{\infty}(t) = \left\|\mathbf{u}_{\infty}(t)\right\|,
+U_{\infty}(t)=\left\|\mathbf{u}_{\infty}(t)\right\|,
 \quad
-\hat{\mathbf{d}}_{\infty}(t) = \frac{\mathbf{u}_{\infty}(t)}{\left\|\mathbf{u}_{\infty}(t)\right\|}
+\hat{\mathbf{d}}_{\infty}(t)=\frac{\mathbf{u}_{\infty}(t)}{\left\|\mathbf{u}_{\infty}(t)\right\|}
 $$
 
-### 2) Semi-Lagrangian advection
+### Incompressible branch (projection pipeline)
 
-For each cell center $\mathbf{x}_{ij}$, backtrace to departure point:
+In incompressible mode, each step follows this sequence (see `step()`):
 
-$$
-\mathbf{x}_d = \mathbf{x}_{ij} - \mathbf{u}(\mathbf{x}_{ij}, t)\,\Delta t
-$$
+1. Apply body/reference-frame acceleration
+2. Enforce directional inlet/outlet boundaries
+3. Semi-Lagrangian advection via `scipy.ndimage.map_coordinates`
+4. Iterative viscous diffusion
+5. LES-style turbulence closure + optional vorticity confinement
+6. Pressure Poisson solve and velocity projection to approximately divergence-free flow
+7. Obstacle + domain boundary cleanup
 
-Then sample with bilinear interpolation (implemented with `scipy.ndimage.map_coordinates`):
-
-$$
-\mathbf{u}^{*}(\mathbf{x}_{ij}) = \mathcal{I}\left[\mathbf{u}^{n}\right](\mathbf{x}_d)
-$$
-
-### 3) Viscous diffusion
-
-The code applies iterative smoothing equivalent to:
+Core relation for projection:
 
 $$
-\frac{\partial \mathbf{u}}{\partial t} = \nu \nabla^2 \mathbf{u}
-$$
-
-in discrete form over interior cells.
-
-### 4) Immersed-boundary no-slip wall damping
-
-Near the obstacle, velocity is decomposed into normal and tangential components:
-
-$$
-u_n = \mathbf{u}\cdot\hat{\mathbf{n}},
+\nabla^2 p = \nabla\cdot\mathbf{u}^{*},
 \quad
-u_t = \mathbf{u}\cdot\hat{\mathbf{t}}
+\mathbf{u}^{n+1}=\mathbf{u}^{*}-\nabla p
 $$
 
-and damped toward no-slip with stronger tangential damping in the wall band:
+### Compressible branch (finite-volume Euler)
 
-$$
-u_n \leftarrow (1-\alpha_n)u_n,
-\quad
-u_t \leftarrow (1-\alpha_t)u_t
-$$
+In compressible mode, each step uses:
 
-where $\alpha_n, \alpha_t$ depend on wall distance, timestep, and a Reynolds-based drag coefficient estimate.
+1. CFL-limited local time step
+2. Conservative Euler update (dimensional splitting)
+3. Interface flux via HLLC (default) or Rusanov
+4. Compressible obstacle state reconstruction
+5. Directional inflow/outflow boundaries + optional downstream sponge
+6. Primitive/conservative synchronization and thermodynamic updates
 
-### 5) LES turbulence model + vorticity confinement
+### Obstacle treatment
 
-Smagorinsky-style eddy viscosity:
+- Incompressible: immersed-boundary style no-slip reconstruction near the wall
+- Compressible: obstacle cells are reset to quiescent thermodynamic states with wall velocity constrained to zero
 
-$$
-\nu_t = C_s^2\,\|S\|,
-\quad
-\nu_{\text{eff}} = \nu + \nu_t
-$$
-
-and optional vorticity confinement force:
-
-$$
-\mathbf{f}_{vc} = \epsilon\,(\hat{\mathbf{n}}_\omega \times \omega)
-$$
-
-(2D scalar-vorticity form in code).
-
-### 6) Pressure projection (incompressibility)
-
-Solve Poisson equation:
-
-$$
-\nabla^2 p = \nabla\cdot\mathbf{u}^{*}
-$$
-
-using Gauss-Seidel, then project:
-
-$$
-\mathbf{u}^{n+1} = \mathbf{u}^{*} - \nabla p
-$$
-
-This enforces approximately divergence-free flow:
-
-$$
-\nabla\cdot\mathbf{u}^{n+1} \approx 0
-$$
-
-### 7) Drag proxy used in visualisation
-
-The plotted drag trend is a proxy combining near-wall dynamic-pressure-like and shear-like terms:
-
-$$
-D_{\text{proxy}} \sim \tfrac{1}{2}\rho\langle u^2+v^2\rangle_{\text{wall band}} + \rho\nu\langle |u_t|\rangle_{\text{wall band}}
-$$
-
-It is useful for trends, not a full force integration.
-
-## Boundary conditions in this implementation
+## Boundary conditions
 
 - Direction-aware inlet/outlet selection from freestream direction
-- Outlet uses zero-gradient outflow (free escape)
-- Cross-flow edges use slip-like conditions
-- Obstacle interior is solid; wall layers damp to no-slip
+- Inlet blended toward target freestream state
+- Outlet uses near zero-gradient outflow behavior
+- Cross-flow boundaries use slip-like handling for the incompressible branch
 
-## Current demo configuration
+## Current demo defaults
 
-In [Simulation.py](Simulation.py):
+### [Simulation.py](Simulation.py)
 
-- Grid: `300 x 600`
-- Rocket profile scaled to keep proportions at high resolution
-- Artemis-like ascent speed envelope (scaled to stable solver units)
-- Warm-up steps before frame capture to reduce startup transient artifacts
+- `USE_COMPRESSIBLE = True`
+- Grid: `140 x 460` (compressible) or `200 x 650` (if switched to incompressible)
+- Compressible defaults: `COMPRESSIBLE_BASE_MACH = 1.45`, `COMPRESSIBLE_CFL_NUMBER = 0.70`, `COMPRESSIBLE_FLUX_SCHEME = "hllc"`
+- Time setup: `time_step = 0.02`, `sim_time = 80.0`, `frame_interval = 0.5` in compressible mode
+
+### [NozzleSim.py](NozzleSim.py)
+
+- Compressible converging-diverging nozzle case
+- Grid: `120 x 400`
+- Defaults: `INLET_MACH = 0.2`, `CFL_NUMBER = 0.45`, `FLUX_SCHEME = "hllc"`
+
+## Outputs
+
+- Visual outputs are written to [outputs/](outputs/)
+- MP4 export is attempted when FFmpeg is available
+- GIF fallback/export is supported via Pillow writer
 
 ## Requirements
 
 - Python 3.10+
-- `numpy`
-- `scipy`
-- `matplotlib`
+- numpy
+- scipy
+- matplotlib
+- seaborn (used by [Drag.py](Drag.py))
 
 Install dependencies:
 
 ```bash
-pip install numpy scipy matplotlib
+pip install numpy scipy matplotlib seaborn
 ```
 
+Optional for MP4 export:
+
+- Install FFmpeg and ensure it is on PATH, or set `FFMPEG_PATH`
+
 ## Run
+
+Rocket demo:
 
 ```bash
 python Simulation.py
 ```
 
-Optional 1D ascent/drag comparison:
+Nozzle demo:
+
+```bash
+python NozzleSim.py
+```
+
+1D ascent/drag comparison:
 
 ```bash
 python Drag.py --mode compare --duration 300 --dt 1

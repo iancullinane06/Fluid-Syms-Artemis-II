@@ -19,8 +19,10 @@ REF_DENSITY     = REF_PRESSURE / (GAS_CONSTANT * REF_TEMPERATURE)
 INLET_MACH      = 0.2       # subsonic inlet — nozzle does the rest
 CFL_NUMBER      = 0.45
 FLUX_SCHEME     = "hllc"
+INLET_TOTAL_PRESSURE = REF_PRESSURE * 1.25
+BACK_PRESSURE        = REF_PRESSURE * 0.60
 
-sim_time        = 6.0
+sim_time        = 60.0
 frame_interval  = 0.5
 num_frames      = int(sim_time / frame_interval)
 time_step       = 0.02
@@ -116,6 +118,12 @@ simulation.set_freestream_thermodynamics(
     density        = REF_DENSITY,
     temperature_k  = REF_TEMPERATURE,
     pressure_pa    = REF_PRESSURE,
+)
+simulation.set_nozzle_pressure_boundary(
+    enabled=True,
+    inlet_total_pressure=INLET_TOTAL_PRESSURE,
+    inlet_total_temperature=REF_TEMPERATURE,
+    outlet_static_pressure=BACK_PRESSURE,
 )
 
 # Register nozzle walls — reuses add_rocket_profile's mask path
@@ -301,6 +309,7 @@ def draw_frame(frame_index: int):
         f"Inlet Mach      : {INLET_MACH:.2f}\n"
         f"Throat Mach     : {throat_mach:.3f}\n"
         f"Exit Mach (avg) : {exit_mach:.3f}\n"
+        f"p0 / pb         : {INLET_TOTAL_PRESSURE / BACK_PRESSURE:.3f}\n"
         f"\nFlux scheme : {FLUX_SCHEME.upper()}\n"
         f"CFL         : {CFL_NUMBER}\n"
         f"Grid        : {ROWS} × {COLS}\n"

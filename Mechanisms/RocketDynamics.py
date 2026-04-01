@@ -33,24 +33,23 @@ class RocketDynamics:
         self,
         mass_kg: float,
         thrust_profile: Callable[[float], float],
-        gravity_mps2: float = 9.80665,
         sim_speed_scale: float = 1.0 / 120.0,
-        drag_force_scale_n: float = 18000.0,
         flight_direction: tuple[float, float] = (1.0, 0.0),
         dry_mass_kg: float | None = None,
         specific_impulse_s: float | None = None,
     ) -> None:
         self.mass_kg = float(max(mass_kg, 1e-6))
         self.thrust_profile = thrust_profile
-        self.gravity_mps2 = float(max(gravity_mps2, 0.0))
         self.sim_speed_scale = float(max(sim_speed_scale, 1e-9))
-        self.drag_force_scale_n = float(max(drag_force_scale_n, 1e-9))
+        self.flight_direction = flight_direction
         self.dry_mass_kg = float(self.mass_kg if dry_mass_kg is None else np.clip(
             dry_mass_kg, 1e-6, self.mass_kg))
         self.specific_impulse_s = None if specific_impulse_s is None else float(
             max(specific_impulse_s, 1e-6))
         self.current_mass_kg = self.mass_kg
         self.reference_density_kg_m3 = 1.225
+        self.gravity_mps2 = 9.80665
+        self.reference_area_m2 = 1.0
 
         direction = np.asarray(flight_direction, dtype=float)
         direction_norm = np.linalg.norm(direction)
@@ -133,7 +132,7 @@ class RocketDynamics:
 
     def rocket_velocity_profile(self, _: float) -> np.ndarray:
         speed_solver = self.state.velocity_mps * self.sim_speed_scale
-        return speed_solver * self.flight_direction
+        return speed_solver * np.asarray(self.flight_direction, dtype=float)
 
     @staticmethod
     def compute_surface_force_components(sim: FluidSimulation) -> tuple[float, float, float, np.ndarray]:
@@ -218,14 +217,25 @@ class RocketDynamics:
         return total_drag, pressure_drag, shear_drag, shear_stress
 
     def compute_drag_components_n(self, sim: FluidSimulation) -> tuple[float, float, float, np.ndarray]:
-        total_drag_solver, pressure_drag_solver, shear_drag_solver, shear_stress = self.compute_surface_force_components(
-            sim)
-        density_scale = float(max(sim.density, 1e-9) /
-                              max(self.reference_density_kg_m3, 1e-9))
-        total_drag_n = total_drag_solver * self.drag_force_scale_n * density_scale
-        pressure_drag_n = pressure_drag_solver * \
-            self.drag_force_scale_n * density_scale
-        shear_drag_n = shear_drag_solver * self.drag_force_scale_n * density_scale
+        total_drag_solver, pressure_drag_solver, shear_drag_solver, shear_stress = self.compute_surface_force_components(sim)
+
+        # CFD-based physical conversion (no arbitrary factor)
+        rho = float(max(sim.density, 1e-9))
+        u_solver = float(max(sim.edge_speed, 1e-6))
+        q_solver = 0.5 * rho * u_solver * u_solver
+        a_solver = self._projected_solver_area(sim)
+        denom = max(q_solver * a_solver, 1e-9)
+
+        cd_total = float(total_drag_solver / denom)
+        cd_pressure = float(pressure_drag_solver / denom)
+        cd_shear = float(shear_drag_solver / denom)
+
+        u_phys = u_solver / max(self.sim_speed_scale, 1e-9)
+        q_phys = 0.5 * rho * u_phys * u_phys
+
+        total_drag_n = cd_total * q_phys * self.reference_area_m2
+        pressure_drag_n = cd_pressure * q_phys * self.reference_area_m2
+        shear_drag_n = cd_shear * q_phys * self.reference_area_m2
         return total_drag_n, pressure_drag_n, shear_drag_n, shear_stress
 
     def compute_drag_components_n_magnitude(self, sim: FluidSimulation) -> tuple[float, float, float, np.ndarray]:
@@ -283,3 +293,15 @@ class RocketDynamics:
         self.state.altitude_m = max(
             0.0, self.state.altitude_m + self.state.velocity_mps * dt)
         return self.state
+
+    @staticmethod
+    def _projected_solver_area(sim: FluidSimulation) -> float:
+        obstacle = getattr(sim, "obstacle_mask", None)
+        if obstacle is None or not np.any(obstacle):
+            return 1.0
+        dx, dy = float(sim.freestream_direction[0]), float(sim.freestream_direction[1])
+        if abs(dx) >= abs(dy):
+            # flow mostly x-direction -> frontal span in y
+            return float(max(np.count_nonzero(np.any(obstacle, axis=1)), 1))
+        # flow mostly y-direction -> frontal span in x
+        return float(max(np.count_nonzero(np.any(obstacle, axis=0)), 1))

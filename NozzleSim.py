@@ -20,9 +20,12 @@ INLET_MACH      = 0.2       # subsonic inlet — nozzle does the rest
 CFL_NUMBER      = 0.45
 FLUX_SCHEME     = "hllc"
 INLET_TOTAL_PRESSURE = REF_PRESSURE * 1.25
-BACK_PRESSURE        = REF_PRESSURE * 0.60
 
-sim_time        = 60.0
+# For this geometry (Ae/At ~ 3.6), a fully supersonic exit needs very low pb/p0.
+BACK_PRESSURE_RATIO  = 0.035
+BACK_PRESSURE        = INLET_TOTAL_PRESSURE * BACK_PRESSURE_RATIO
+
+sim_time        = 6.0
 frame_interval  = 0.5
 num_frames      = int(sim_time / frame_interval)
 time_step       = 0.02

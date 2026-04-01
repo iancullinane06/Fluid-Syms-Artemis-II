@@ -16,7 +16,10 @@ GAMMA_AIR = 1.4
 SUTHERLAND_REFERENCE_T = 273.15
 SUTHERLAND_REFERENCE_MU = 1.716e-5
 SUTHERLAND_S = 110.4
+PLOT_DPI = 300
+PLOT_FIGSIZE = (9, 5.4)
 
+sns.set_theme(style="whitegrid", context="talk")
 
 NOSECONE_MODELS: dict[str, NoseconeModel] = {
     "artemis2_rounded_conic": NoseconeModel("artemis2_rounded_conic", "Artemis II Rounded-Conic", 0.90, 0.15),
@@ -166,18 +169,54 @@ def reynolds_and_drag(
     return reynolds_number, adjusted_cd
 
 
-def drag_force(
-        profile: RocketProfile,
-        velocity_m_s: float,
-        atmosphere: AtmosphereState,
-        nosecone_style: str = "artemis2_rounded_conic",
-) -> tuple[float, float, float]:
-    reynolds_number, drag_coefficient = reynolds_and_drag(
-        profile, velocity_m_s, atmosphere, nosecone_style=nosecone_style)
+def drag_components(
+    profile: RocketProfile,
+    velocity_m_s: float,
+    atmosphere: AtmosphereState,
+    nosecone_style: str = "artemis2_rounded_conic",
+) -> dict[str, float]:
+    reynolds_number = calculate_reynolds_number(
+        density=atmosphere.density_kg_m3,
+        velocity=max(abs(velocity_m_s), 1e-6),
+        characteristic_length=max(float(profile.height), float(profile.width), 1e-6),
+        viscosity=atmosphere.dynamic_viscosity_pa_s,
+    )
+    mach_number = abs(velocity_m_s) / max(atmosphere.speed_of_sound_m_s, 1e-6)
+
+    base_cd = calculate_drag_coefficient(reynolds_number)
+    cd_subsonic = base_cd * profile_drag_adjustment(profile) * nosecone_drag_adjustment(nosecone_style)
+    cd_wave = nosecone_wave_drag(mach_number, nosecone_style)
+
+    # Empirical split for reporting
+    skin_fraction = float(np.clip(0.16 - 0.02 * np.log10(max(reynolds_number, 1.0)), 0.05, 0.14))
+    cd_skin = cd_subsonic * skin_fraction
+    cd_form = max(cd_subsonic - cd_skin, 0.0)
+    cd_total = max(cd_skin + cd_form + cd_wave, 0.015)
+
+    q = 0.5 * atmosphere.density_kg_m3 * velocity_m_s * velocity_m_s
     area = reference_area(profile)
-    drag = 0.5 * atmosphere.density_kg_m3 * drag_coefficient * \
-        area * velocity_m_s * abs(velocity_m_s)
-    return drag, reynolds_number, drag_coefficient
+
+    return {
+        "re": float(reynolds_number),
+        "mach": float(mach_number),
+        "cd_skin": float(cd_skin),
+        "cd_form": float(cd_form),
+        "cd_wave": float(cd_wave),
+        "cd_total": float(cd_total),
+        "drag_skin_n": float(q * area * cd_skin),
+        "drag_form_n": float(q * area * cd_form),
+        "drag_mach_n": float(q * area * cd_wave),
+        "drag_total_n": float(q * area * cd_total),
+    }
+
+def drag_force(
+    profile: RocketProfile,
+    velocity_m_s: float,
+    atmosphere: AtmosphereState,
+    nosecone_style: str = "artemis2_rounded_conic",
+) -> tuple[float, float, float]:
+    components = drag_components(profile, velocity_m_s, atmosphere, nosecone_style=nosecone_style)
+    return components["drag_total_n"], components["re"], components["cd_total"]
 
 
 def thrust_profile(time_s: float, propulsive_force_n: float, burn_time_s: float) -> float:
@@ -367,150 +406,156 @@ def print_drag_summary(
     final_atmosphere = standard_atmosphere(final_altitude_m)
 
     model = NOSECONE_MODELS.get(nosecone_style, NOSECONE_MODELS["conic"])
-    print(f"\nProfile: {profile.name} | Nosecone: {model.label}")
+
+    print("\n" + "=" * 72)
+    print(f" Drag Report — {profile.name} ({model.label})")
+    print("=" * 72)
     print(
-        f"Mass: {profile.mass:.2f} kg | Diameter: {profile.width:.3f} m | Length: {profile.height:.3f} m")
+        f" Mass: {profile.mass:,.2f} kg | Diameter: {profile.width:.3f} m | Length: {profile.height:.3f} m")
     print(
-        f"F_prop: {propulsive_force_n:.2f} N | Burn time: {profile.burn_time:.2f} s")
+        f" Thrust: {propulsive_force_n:,.2f} N | Burn time: {profile.burn_time:.2f} s")
     print(
-        f"Reference area: {reference_area(profile):.4f} m^2 | Fineness ratio: {fineness_ratio(profile):.2f}")
+        f" Reference area: {reference_area(profile):.4f} m^2 | Fineness ratio: {fineness_ratio(profile):.2f}")
     print(
-        f"Sea-level density: {sea_level.density_kg_m3:.4f} kg/m^3 | Sea-level viscosity: {sea_level.dynamic_viscosity_pa_s:.3e} Pa·s")
+        f" Sea-level rho: {sea_level.density_kg_m3:.4f} kg/m^3 | mu: {sea_level.dynamic_viscosity_pa_s:.3e} Pa·s")
     print(
-        f"Final altitude density: {final_atmosphere.density_kg_m3:.4f} kg/m^3 | Gravity there: {final_atmosphere.gravity_m_s2:.4f} m/s^2")
-    print("\nDrag-focused flight summary")
-    print(f"- Final altitude: {summary['final_altitude_m']:.2f} m")
-    print(f"- Final drag force: {summary['final_drag_n']:.2f} N")
-    print(
-        f"- Peak drag force: {summary['peak_drag_n']:.2f} N at t={summary['peak_drag_time_s']:.2f} s")
-    print(f"- Mean drag force: {summary['mean_drag_n']:.2f} N")
-    print(f"- Drag time-integral: {summary['drag_time_integral_n_s']:.2f} N·s")
-    print(
-        f"- Ballistic coefficient: {summary['ballistic_coefficient']:.2f} kg/m^2")
+        f" Final-alt rho: {final_atmosphere.density_kg_m3:.4f} kg/m^3 | g: {final_atmosphere.gravity_m_s2:.4f} m/s^2")
+    print("-" * 72)
+    print(f" {'Final altitude':<42}{summary['final_altitude_m']:>14.2f} m")
+    print(f" {'Final drag force':<42}{summary['final_drag_n']:>14.2f} N")
+    print(f" {'Peak drag force':<42}{summary['peak_drag_n']:>14.2f} N")
+    print(f" {'Peak drag time':<42}{summary['peak_drag_time_s']:>14.2f} s")
+    print(f" {'Mean drag force':<42}{summary['mean_drag_n']:>14.2f} N")
+    print(f" {'Drag time-integral':<42}{summary['drag_time_integral_n_s']:>14.2f} N·s")
+    print(f" {'Ballistic coefficient':<42}{summary['ballistic_coefficient']:>14.2f} kg/m^2")
 
     if summary["launch_terminal_velocity_m_s"] is None:
-        print("- Sea-level powered terminal velocity: unavailable (F_prop does not exceed weight)")
+        print(f" {'Sea-level powered terminal velocity':<42}{'unavailable':>14}")
     else:
         print(
-            "- Sea-level powered terminal velocity: "
-            f"{summary['launch_terminal_velocity_m_s']:.2f} m/s "
+            f" {'Sea-level powered terminal velocity':<42}"
+            f"{summary['launch_terminal_velocity_m_s']:>14.2f} m/s "
             f"(Re={summary['launch_terminal_re']:.3e}, Cd={summary['launch_terminal_cd']:.3f})"
         )
 
     if summary["final_altitude_terminal_velocity_m_s"] is None:
-        print("- Final-altitude powered terminal velocity: unavailable (F_prop does not exceed weight)")
+        print(f" {'Final-alt powered terminal velocity':<42}{'unavailable':>14}")
     else:
         print(
-            "- Final-altitude powered terminal velocity: "
-            f"{summary['final_altitude_terminal_velocity_m_s']:.2f} m/s "
+            f" {'Final-alt powered terminal velocity':<42}"
+            f"{summary['final_altitude_terminal_velocity_m_s']:>14.2f} m/s "
             f"(Re={summary['final_altitude_terminal_re']:.3e}, Cd={summary['final_altitude_terminal_cd']:.3f})"
         )
 
-    print(
-        f"- Terminal velocity reached during burn: {summary['terminal_reached_during_burn']}")
-    print("\nSampled drag history (roughly 12 points)")
+    print(f" {'Terminal reached during burn':<42}{summary['terminal_reached_during_burn']:>14}")
+    print("-" * 72)
+    print(" Sampled drag history (~12 points)")
+    print("-" * 72)
 
     stride = max(len(samples) // 12, 1)
     for sample in samples[::stride]:
         print(
-            f"t={sample.time_s:6.2f} s | alt={sample.altitude_m:9.2f} m | "
-            f"drag={sample.drag_n:11.2f} N | a={sample.acceleration_m_s2:7.3f} m/s^2 | "
-            f"Re={sample.reynolds_number:9.3e} | Cd={sample.drag_coefficient:6.3f} | "
-            f"rho={sample.density_kg_m3:6.3f} kg/m^3"
+            f" t={sample.time_s:7.2f} s | alt={sample.altitude_m:10.2f} m | "
+            f"drag={sample.drag_n:12.2f} N | a={sample.acceleration_m_s2:8.3f} m/s^2 | "
+            f"Re={sample.reynolds_number:10.3e} | Cd={sample.drag_coefficient:6.3f} | "
+            f"rho={sample.density_kg_m3:7.3f} kg/m^3"
         )
+    print("=" * 72)
 
 
-def plot_drag_history(samples: list[FlightSample], title: str) -> None:
-    sns.set_theme(style="darkgrid", palette="Blues")
-    times = np.array([sample.time_s for sample in samples], dtype=float)
-    drag = np.array([sample.drag_n for sample in samples], dtype=float)
+def plot_drag_vs_mach(samples: list[FlightSample]) -> None:
+    mach = np.array([s.mach_number for s in samples])
+    drag = np.array([s.drag_n for s in samples])
 
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-    ax.plot(times, drag, linewidth=2.4, marker="o",
-            markersize=3, alpha=0.8, color="#1f77b4")
-    ax.set_xlabel("Time (s)", fontsize=11)
-    ax.set_ylabel("Drag Force (N)", fontsize=11)
-    ax.set_title(title, fontsize=13, fontweight="bold")
-    fig.tight_layout()
+    plt.figure(figsize=PLOT_FIGSIZE)
+    plt.plot(mach, drag, linewidth=2.5, color="#1f77b4")
+    plt.axvline(1.0, linestyle="--", linewidth=1.5, color="#d62728", alpha=0.8, label="Mach 1")
+    plt.xlabel("Mach Number")
+    plt.ylabel("Drag Force (N)")
+    plt.title("Drag Rise Across Mach Regimes")
+    plt.legend(frameon=True)
+    plt.tight_layout()
+    plt.savefig("drag_vs_mach.png", dpi=PLOT_DPI)
     plt.show()
 
 
-def plot_drag_comparison(results: dict[str, list[FlightSample]]) -> None:
-    sns.set_theme(style="darkgrid", palette="Blues")
-    styles = list(results.keys())
-    palette = sns.color_palette("Blues", len(styles))
+def plot_drag_components(samples: list[FlightSample], profile: RocketProfile, nosecone_style: str = "artemis2_rounded_conic") -> None:
+    mach = []
+    skin = []
+    form = []
+    wave = []
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Rocket Flight Analysis: 6 Nosecone Designs",
-                 fontsize=16, fontweight="bold", y=0.995)
+    for s in samples:
+        atm = standard_atmosphere(s.altitude_m)
+        comp = drag_components(profile, s.velocity_m_s, atm, nosecone_style=nosecone_style)
+        mach.append(comp["mach"])
+        skin.append(comp["drag_skin_n"])
+        form.append(comp["drag_form_n"])
+        wave.append(comp["drag_mach_n"])
 
-    # Subplot 1: Drag Force vs Time
-    ax1 = axes[0, 0]
-    for color, style in zip(palette, styles):
-        samples = results[style]
-        times = np.array([sample.time_s for sample in samples], dtype=float)
-        drag = np.array([sample.drag_n for sample in samples], dtype=float)
-        label = NOSECONE_MODELS.get(
-            style, NoseconeModel(style, style, 1.0, 0.1)).label
-        ax1.plot(times, drag, linewidth=2.3, color=color,
-                 label=label, marker="o", markersize=2, alpha=0.8)
-    ax1.set_xlabel("Time (s)", fontsize=10)
-    ax1.set_ylabel("Drag Force (N)", fontsize=10)
-    ax1.set_title("Drag Force vs Time", fontsize=11, fontweight="bold")
-    ax1.legend(loc="upper left", fontsize=8)
+    mach = np.array(mach)
 
-    # Subplot 2: Reynolds Number vs Time
-    ax2 = axes[0, 1]
-    for color, style in zip(palette, styles):
-        samples = results[style]
-        times = np.array([sample.time_s for sample in samples], dtype=float)
-        reynolds = np.array(
-            [sample.reynolds_number for sample in samples], dtype=float)
-        label = NOSECONE_MODELS.get(
-            style, NoseconeModel(style, style, 1.0, 0.1)).label
-        ax2.plot(times, reynolds, linewidth=2.3, color=color,
-                 label=label, marker="s", markersize=2, alpha=0.8)
-    ax2.set_xlabel("Time (s)", fontsize=10)
-    ax2.set_ylabel("Reynolds Number", fontsize=10)
-    ax2.set_title("Reynolds Number vs Time", fontsize=11, fontweight="bold")
-    ax2.set_yscale("log")
+    plt.figure(figsize=PLOT_FIGSIZE)
+    plt.plot(mach, skin, label="Skin Drag", linewidth=2.2, color="#2ca02c")
+    plt.plot(mach, form, label="Form Drag", linewidth=2.2, color="#ff7f0e")
+    plt.plot(mach, wave, label="Wave Drag", linewidth=2.2, color="#9467bd")
+    plt.axvline(1.0, linestyle="--", linewidth=1.5, color="#d62728", alpha=0.8)
+    plt.xlabel("Mach Number")
+    plt.ylabel("Drag Force (N)")
+    plt.title("Drag Component Breakdown")
+    plt.legend(frameon=True)
+    plt.tight_layout()
+    plt.savefig("drag_components.png", dpi=PLOT_DPI)
+    plt.show()
 
-    # Subplot 3: Drag Coefficient vs Velocity
-    ax3 = axes[1, 0]
-    for color, style in zip(palette, styles):
-        samples = results[style]
-        velocities = np.array(
-            [sample.velocity_m_s for sample in samples], dtype=float)
-        drag_coeff = np.array(
-            [sample.drag_coefficient for sample in samples], dtype=float)
-        label = NOSECONE_MODELS.get(
-            style, NoseconeModel(style, style, 1.0, 0.1)).label
-        ax3.plot(velocities, drag_coeff, linewidth=2.3, color=color,
-                 label=label, marker="^", markersize=2, alpha=0.8)
-    ax3.set_xlabel("Velocity (m/s)", fontsize=10)
-    ax3.set_ylabel("Drag Coefficient (Cd)", fontsize=10)
-    ax3.set_title("Drag Coefficient vs Velocity",
-                  fontsize=11, fontweight="bold")
 
-    # Subplot 4: Mach Number vs Time
-    ax4 = axes[1, 1]
-    for color, style in zip(palette, styles):
-        samples = results[style]
-        times = np.array([sample.time_s for sample in samples], dtype=float)
-        mach = np.array(
-            [sample.mach_number for sample in samples], dtype=float)
-        label = NOSECONE_MODELS.get(
-            style, NoseconeModel(style, style, 1.0, 0.1)).label
-        ax4.plot(times, mach, linewidth=2.3, color=color,
-                 label=label, marker="D", markersize=2, alpha=0.8)
-    ax4.set_xlabel("Time (s)", fontsize=10)
-    ax4.set_ylabel("Mach Number", fontsize=10)
-    ax4.set_title("Mach Number vs Time", fontsize=11, fontweight="bold")
-    ax4.legend(loc="upper left", fontsize=8)
-    ax4.axhline(y=1.0, color="red", linestyle="--",
-                linewidth=1.5, alpha=0.5, label="Mach 1 (Sonic)")
+def plot_dynamic_pressure(samples: list[FlightSample]) -> None:
+    time = np.array([s.time_s for s in samples])
+    q = np.array([s.dynamic_pressure_pa for s in samples])
 
+    plt.figure(figsize=PLOT_FIGSIZE)
+    plt.plot(time, q, linewidth=2.5, color="#17becf")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Dynamic Pressure (Pa)")
+    plt.title("Dynamic Pressure vs Time (Max-Q)")
+    plt.tight_layout()
+    plt.savefig("dynamic_pressure.png", dpi=PLOT_DPI)
+    plt.show()
+
+
+def plot_mach_altitude(samples: list[FlightSample]) -> None:
+    time = np.array([s.time_s for s in samples])
+    mach = np.array([s.mach_number for s in samples])
+    alt = np.array([s.altitude_m for s in samples])
+
+    fig, ax1 = plt.subplots(figsize=PLOT_FIGSIZE)
+    ax1.plot(time, mach, linewidth=2.4, color="#1f77b4")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("Mach Number", color="#1f77b4")
+    ax1.tick_params(axis="y", labelcolor="#1f77b4")
+
+    ax2 = ax1.twinx()
+    ax2.plot(time, alt, linewidth=2.0, color="#ff7f0e", alpha=0.85)
+    ax2.set_ylabel("Altitude (m)", color="#ff7f0e")
+    ax2.tick_params(axis="y", labelcolor="#ff7f0e")
+
+    plt.title("Mach and Altitude Evolution")
     fig.tight_layout()
+    plt.savefig("mach_altitude.png", dpi=PLOT_DPI)
+    plt.show()
+
+
+def plot_drag_time(samples: list[FlightSample]) -> None:
+    time = np.array([s.time_s for s in samples])
+    drag = np.array([s.drag_n for s in samples])
+
+    plt.figure(figsize=PLOT_FIGSIZE)
+    plt.plot(time, drag, linewidth=2.5, color="#1f77b4")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Drag (N)")
+    plt.title("Drag Force vs Time")
+    plt.tight_layout()
+    plt.savefig("drag_time.png", dpi=PLOT_DPI)
     plt.show()
 
 
@@ -538,7 +583,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         type=str,
         choices=["single", "compare"],
-        default="compare",
+        default="single",
         help="Run a single nosecone simulation or compare all built-in nosecone designs",
     )
     parser.add_argument(
@@ -569,32 +614,31 @@ def main() -> None:
         height=args.height,
     )
 
-    if args.mode == "single":
+    # Force Artemis nosecone for paper plots
+    artemis_style = "artemis2_rounded_conic"
+
+    if args.mode != "compare":
         samples = simulate_profile_ascent(
             profile=profile,
             propulsive_force_n=args.thrust,
             total_time_s=args.duration,
             time_step_s=args.dt,
-            nosecone_style=args.nosecone,
+            nosecone_style=artemis_style,
             launch_altitude_m=args.launch_altitude,
         )
-        print_drag_summary(profile, args.thrust, samples,
-                           nosecone_style=args.nosecone)
+        print_drag_summary(profile, args.thrust, samples, nosecone_style=artemis_style)
+
+        # Replaces old plot_drag_history call
         if args.plot:
-            model_label = NOSECONE_MODELS.get(args.nosecone, NoseconeModel(
-                args.nosecone, args.nosecone, 1.0, 0.1)).label
-            plot_drag_history(
-                samples, title=f"Drag Force vs Time | {model_label}")
+            plot_drag_time(samples)
+            plot_drag_vs_mach(samples)
+            plot_drag_components(samples, profile, nosecone_style=artemis_style)
+            plot_dynamic_pressure(samples)
+            plot_mach_altitude(samples)
         return
 
-    comparison_styles = [
-        "artemis2_rounded_conic",
-        "elliptical",
-        "conic",
-        "bi_conic",
-        "ogive",
-        "von_karman",
-    ]
+    # Optional: keep compare mode non-plotting or summary-only
+    comparison_styles = [artemis_style]
     all_results: dict[str, list[FlightSample]] = {}
 
     for style in comparison_styles:
@@ -608,10 +652,6 @@ def main() -> None:
         )
         all_results[style] = samples
         print_drag_summary(profile, args.thrust, samples, nosecone_style=style)
-
-    if args.plot:
-        plot_drag_comparison(all_results)
-
 
 if __name__ == "__main__":
     main()

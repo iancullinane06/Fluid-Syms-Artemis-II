@@ -1,10 +1,12 @@
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+import seaborn as sns
 from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
 from matplotlib.widgets import Slider
 
@@ -21,6 +23,15 @@ def _build_video_basename(
 ) -> str:
     mach_tag = f"m{inlet_mach:.2f}".replace(".", "p")
     return f"{video_basename}_{compressible_flux_scheme}_{mach_tag}_{_safe_tag(video_case_tag)}"
+
+
+def _style_field_axis(ax: Any, title: str, rows: int, cols: int) -> None:
+    """Style a field axis with consistent formatting."""
+    ax.set(aspect=1, title=title)
+    ax.set_xlabel("X", fontsize=9)
+    ax.set_ylabel("Y", fontsize=9)
+    ax.set_xlim(0, cols - 1)
+    ax.set_ylim(0, rows - 1)
 
 
 def _resolve_ffmpeg_executable() -> str | None:
@@ -52,6 +63,15 @@ def _save_simulation_video(
 ) -> None:
     output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    width_in, height_in = fig.get_size_inches()
+    width_px = max(int(round(width_in * float(video_dpi))), 2)
+    height_px = max(int(round(height_in * float(video_dpi))), 2)
+    if width_px % 2 != 0:
+        width_px += 1
+    if height_px % 2 != 0:
+        height_px += 1
+    fig.set_size_inches(width_px / float(video_dpi), height_px / float(video_dpi), forward=True)
 
     animation = FuncAnimation(
         fig,
@@ -86,7 +106,7 @@ def _save_simulation_video(
             animation.save(str(mp4_path), writer=writer, dpi=video_dpi)
             print(f"Saved video: {mp4_path}")
             saved_mp4 = True
-        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        except (FileNotFoundError, OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
             print(f"FFmpeg export failed ({exc}).")
     else:
         print("FFmpeg executable not found (set FFMPEG_PATH or install ffmpeg).")
@@ -168,7 +188,7 @@ def build_and_render_visualisations(
         frame_net_force_n = frame["frame_net_force_n"]
         frame_rocket_speed_mps = frame["frame_rocket_speed_mps"]
 
-        ax_speed.set_facecolor("white")
+        ax_speed.set_facecolor("#f7f7f7")
         im_speed = ax_speed.imshow(
             speed_plot,
             origin="lower",
@@ -176,30 +196,45 @@ def build_and_render_visualisations(
             vmin=limits["global_min_speed"],
             vmax=limits["global_max_speed"],
             extent=(0, cols - 1, 0, rows - 1),
-            alpha=0.75,
+            alpha=0.85,
             interpolation="bilinear",
         )
-        ax_speed.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-        ax_speed.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
-        ax_speed.set(aspect=1, title="Velocity Magnitude")
-        ax_speed.set_xlabel("X", fontsize=9)
-        ax_speed.set_ylabel("Y", fontsize=9)
-        ax_speed.set_xlim(0, cols - 1)
-        ax_speed.set_ylim(0, rows - 1)
-        if "speed" not in colorbars:
-            colorbars["speed"] = plt.colorbar(im_speed, ax=ax_speed, fraction=0.046, pad=0.04)
-            colorbars["speed"].set_label("m/s", fontsize=8)
-        else:
-            colorbars["speed"].update_normal(im_speed)
+        ax_speed.fill(profile_x, profile_y, color="#4C72B0", alpha=0.28, zorder=6)
+        ax_speed.plot(profile_x, profile_y, color="#1f4e8c", linewidth=1.6, zorder=7)
 
-        ax_pressure.set_facecolor("white")
+        # Optional streamline overlay (requires velocity components in frame dict)
+        if "u_plot" in frame and "v_plot" in frame:
+            u_plot = np.asarray(frame["u_plot"], dtype=float)
+            v_plot = np.asarray(frame["v_plot"], dtype=float)
+            y_coords = np.arange(rows)
+            x_coords = np.arange(cols)
+            # light subsampling for readability/performance
+            step = max(min(rows, cols) // 60, 1)
+            ax_speed.streamplot(
+                x_coords[::step],
+                y_coords[::step],
+                u_plot[::step, ::step],
+                v_plot[::step, ::step],
+                color="white",
+                linewidth=0.6,
+                density=1.0,
+                arrowsize=0.7,
+                minlength=0.05,
+                zorder=8,
+            )
+
+        _style_field_axis(ax_speed, "Velocity Magnitude", rows, cols)
+
+        ax_pressure.set_facecolor("#f7f7f7")
         pressure_vmin = limits["global_min_pressure"]
         pressure_vmax = limits["global_max_pressure"]
         pressure_title = "Pressure Field"
         if simulation.compressible:
-            pressure_min = np.nanpercentile(pressure_plot, 1)
-            pressure_max = np.nanpercentile(pressure_plot, 99)
-            pressure_lim = max(abs(pressure_min), abs(pressure_max), 1.0)
+            pressure_lim = max(
+                abs(float(limits["global_min_pressure"])),
+                abs(float(limits["global_max_pressure"])),
+                1.0,
+            )
             pressure_vmin = -pressure_lim
             pressure_vmax = pressure_lim
             pressure_title = "Gauge Pressure Field"
@@ -214,18 +249,9 @@ def build_and_render_visualisations(
             alpha=0.75,
             interpolation="bilinear",
         )
-        ax_pressure.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-        ax_pressure.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
-        ax_pressure.set(aspect=1, title=pressure_title)
-        ax_pressure.set_xlabel("X", fontsize=9)
-        ax_pressure.set_ylabel("Y", fontsize=9)
-        ax_pressure.set_xlim(0, cols - 1)
-        ax_pressure.set_ylim(0, rows - 1)
-        if "pressure" not in colorbars:
-            colorbars["pressure"] = plt.colorbar(im_pressure, ax=ax_pressure, fraction=0.046, pad=0.04)
-            colorbars["pressure"].set_label("Pa", fontsize=8)
-        else:
-            colorbars["pressure"].update_normal(im_pressure)
+        ax_pressure.fill(profile_x, profile_y, color="#4C72B0", alpha=0.28, zorder=6)
+        ax_pressure.plot(profile_x, profile_y, color="#1f4e8c", linewidth=1.6, zorder=7)
+        _style_field_axis(ax_pressure, pressure_title, rows, cols)
 
         if simulation.compressible:
             mach_plot = frame["mach_plot"]
@@ -251,8 +277,8 @@ def build_and_render_visualisations(
                 alpha=0.75,
                 interpolation="bilinear",
             )
-            ax_streamwise.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-            ax_streamwise.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+            ax_streamwise.fill(profile_x, profile_y, color="#4C72B0", alpha=0.28, zorder=6)
+            ax_streamwise.plot(profile_x, profile_y, color="#1f4e8c", linewidth=1.6, zorder=7)
             ax_streamwise.set(aspect=1, title="Local Mach Number")
             ax_streamwise.set_xlabel("X", fontsize=9)
             ax_streamwise.set_ylabel("Y", fontsize=9)
@@ -288,8 +314,8 @@ def build_and_render_visualisations(
                 alpha=0.75,
                 interpolation="bilinear",
             )
-            ax_vortex.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-            ax_vortex.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+            ax_vortex.fill(profile_x, profile_y, color="#4C72B0", alpha=0.28, zorder=6)
+            ax_vortex.plot(profile_x, profile_y, color="#1f4e8c", linewidth=1.6, zorder=7)
             ax_vortex.set(aspect=1, title="Density Field")
             ax_vortex.set_xlabel("X", fontsize=9)
             ax_vortex.set_ylabel("Y", fontsize=9)
@@ -318,8 +344,8 @@ def build_and_render_visualisations(
                 alpha=0.75,
                 interpolation="bilinear",
             )
-            ax_streamwise.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-            ax_streamwise.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+            ax_streamwise.fill(profile_x, profile_y, color="#4C72B0", alpha=0.28, zorder=6)
+            ax_streamwise.plot(profile_x, profile_y, color="#1f4e8c", linewidth=1.6, zorder=7)
             ax_streamwise.set(aspect=1, title="Streamwise Velocity")
             ax_streamwise.set_xlabel("X", fontsize=9)
             ax_streamwise.set_ylabel("Y", fontsize=9)
@@ -345,8 +371,8 @@ def build_and_render_visualisations(
                 alpha=0.75,
                 interpolation="bilinear",
             )
-            ax_vortex.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-            ax_vortex.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+            ax_vortex.fill(profile_x, profile_y, color="#4C72B0", alpha=0.28, zorder=6)
+            ax_vortex.plot(profile_x, profile_y, color="#1f4e8c", linewidth=1.6, zorder=7)
             ax_vortex.set(aspect=1, title="Vorticity Magnitude")
             ax_vortex.set_xlabel("X", fontsize=9)
             ax_vortex.set_ylabel("Y", fontsize=9)
@@ -367,43 +393,15 @@ def build_and_render_visualisations(
         history_net = np.array([item[8] for item in drag_history[: frame_index + 1]], dtype=float)
         history_altitude = np.array([item[9] for item in drag_history[: frame_index + 1]], dtype=float)
 
-        ax_drag.plot(history_time, history_drag_total, color="#1f77b4", linewidth=2.0, label="Total")
-        ax_drag.plot(
-            history_time,
-            history_drag_total_signed,
-            color="#17becf",
-            linewidth=1.1,
-            linestyle="-.",
-            label="Signed Total",
-        )
-        ax_drag.plot(
-            history_time,
-            history_drag_pressure,
-            color="#d62728",
-            linewidth=1.3,
-            linestyle="--",
-            label="Pressure",
-        )
-        ax_drag.plot(
-            history_time,
-            history_drag_shear,
-            color="#2ca02c",
-            linewidth=1.3,
-            linestyle="--",
-            label="Shear",
-        )
-        ax_drag.plot(history_time, history_thrust, color="#9467bd", linewidth=1.5, linestyle=":", label="Thrust")
-        ax_drag.plot(
-            history_time,
-            history_net,
-            color="#ff7f0e",
-            linewidth=1.5,
-            linestyle="-.",
-            label="Net (T-D-W)",
-        )
-        ax_drag.scatter([frame_time], [drag_total_signed], color="black", s=34, zorder=3)
+        ax_drag.plot(history_time, history_drag_total, color=sns.color_palette("deep")[0], linewidth=2.2, label="Total")
+        ax_drag.plot(history_time, history_drag_total_signed, color=sns.color_palette("deep")[9], linewidth=1.2, linestyle="-.", label="Signed Total")
+        ax_drag.plot(history_time, history_drag_pressure, color=sns.color_palette("deep")[3], linewidth=1.4, linestyle="--", label="Pressure")
+        ax_drag.plot(history_time, history_drag_shear, color=sns.color_palette("deep")[2], linewidth=1.4, linestyle="--", label="Shear")
+        ax_drag.plot(history_time, history_thrust, color=sns.color_palette("deep")[4], linewidth=1.6, linestyle=":", label="Thrust")
+        ax_drag.plot(history_time, history_net, color=sns.color_palette("deep")[1], linewidth=1.6, linestyle="-.", label="Net (T-D-W)")
+        ax_drag.scatter([frame_time], [drag_total_signed], color="black", s=26, zorder=4)
 
-        ax_drag_altitude.plot(history_time, history_altitude, color="#111111", linewidth=1.4, linestyle="-", label="Altitude")
+        ax_drag_altitude.plot(history_time, history_altitude, color="#2f2f2f", linewidth=1.4, linestyle="-", label="Altitude")
         ax_drag_altitude.set_ylabel("Altitude (m)", fontsize=9)
 
         if history_time.size > 0:
@@ -432,8 +430,9 @@ def build_and_render_visualisations(
         ax_drag.set_ylim(y_min - 0.1 * y_span, y_max + 0.1 * y_span)
         ax_drag.set_ylabel("Force (N)", fontsize=9)
         ax_drag.set_xlabel("Time (s)", fontsize=9)
-        ax_drag.grid(True, alpha=0.3)
+        ax_drag.grid(True, alpha=0.28)
         ax_drag.set_title("Forces & Altitude vs Time", fontsize=10)
+        sns.despine(ax=ax_drag, right=False)
         force_handles, force_labels = ax_drag.get_legend_handles_labels()
         altitude_handles, altitude_labels = ax_drag_altitude.get_legend_handles_labels()
         ax_drag.legend(force_handles + altitude_handles, force_labels + altitude_labels, fontsize=8, loc="best")
@@ -463,8 +462,8 @@ def build_and_render_visualisations(
                 alpha=0.75,
                 interpolation="bilinear",
             )
-            ax_shear.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-            ax_shear.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+            ax_shear.fill(profile_x, profile_y, color="#4C72B0", alpha=0.28, zorder=6)
+            ax_shear.plot(profile_x, profile_y, color="#1f4e8c", linewidth=1.6, zorder=7)
             ax_shear.set(aspect=1, title="Temperature Field")
             ax_shear.set_xlabel("X", fontsize=9)
             ax_shear.set_ylabel("Y", fontsize=9)
@@ -489,8 +488,8 @@ def build_and_render_visualisations(
                 alpha=0.75,
                 interpolation="bilinear",
             )
-            ax_shear.fill(profile_x, profile_y, color="cornflowerblue", alpha=0.35, zorder=6)
-            ax_shear.plot(profile_x, profile_y, color="blue", linewidth=1.5, zorder=7)
+            ax_shear.fill(profile_x, profile_y, color="#4C72B0", alpha=0.28, zorder=6)
+            ax_shear.plot(profile_x, profile_y, color="#1f4e8c", linewidth=1.6, zorder=7)
             ax_shear.set(aspect=1, title="Wall Shear Stress Magnitude")
             ax_shear.set_xlabel("X", fontsize=9)
             ax_shear.set_ylabel("Y", fontsize=9)

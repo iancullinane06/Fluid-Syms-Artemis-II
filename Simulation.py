@@ -10,14 +10,15 @@ from Mechanisms.Visualisation import build_and_render_visualisations
 # - small physics dt keeps advection/projection stable
 # - larger frame interval keeps animation length manageable
 # - compressible mode may substep internally with a CFL-limited dt
+
 USE_COMPRESSIBLE = True
-time_step = 0.02 if USE_COMPRESSIBLE else 0.1
-sim_time = 80.0 if USE_COMPRESSIBLE else 250.0
-frame_interval = 0.5 if USE_COMPRESSIBLE else 1.0
+time_step = 0.02 if USE_COMPRESSIBLE else 0.01
+sim_time = 80.0 if USE_COMPRESSIBLE else 45.0
+frame_interval = 0.5 if USE_COMPRESSIBLE else 0.01
 num_frames = int(sim_time / frame_interval)
 
 SIM_SPEED_SCALE = 1.0 if USE_COMPRESSIBLE else 1.0 / 80.0
-COMPRESSIBLE_BASE_MACH = 1.45
+COMPRESSIBLE_BASE_MACH = 0.75
 COMPRESSIBLE_GUST_MACH = 0.025
 COMPRESSIBLE_CFL_NUMBER = 0.70
 COMPRESSIBLE_FLUX_SCHEME = "hllc"
@@ -26,7 +27,7 @@ EXPORT_VIDEO = True
 SHOW_PLOT = True
 VIDEO_FPS = 20
 VIDEO_DPI = 140
-VIDEO_BASENAME = "rocket_compressible"
+VIDEO_BASENAME = "rocket_compressible" if USE_COMPRESSIBLE else "rocket_incompressible"
 EXPORT_GIF_COPY = True
 VIDEO_CASE_TAG = "baseline"
 FIGURE_HEIGHT_SCALE = 1.20
@@ -66,7 +67,6 @@ dynamics = RocketDynamics(
     mass_kg=rocket.mass,
     thrust_profile=thrust_profile_n,
     sim_speed_scale=SIM_SPEED_SCALE,
-    drag_force_scale_n=18000.0,
     flight_direction=(1.0, 0.0),
     dry_mass_kg=900_000.0,
     specific_impulse_s=330.0,
